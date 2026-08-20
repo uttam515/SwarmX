@@ -1,0 +1,99 @@
+{
+  "timestamp": "2026-08-18T20:52:19Z",
+  "platform": "darwin",
+  "kernelId": "image_filter_box_blur_v1",
+  "crossoverResolution": "1024x1024 (4 MB)",
+  "results": [
+    {
+      "resolution": "32x32",
+      "width": 32,
+      "height": 32,
+      "payloadBytes": 4096,
+      "pilMedianMs": 0.116,
+      "pilP95Ms": 0.866,
+      "throughputMBs": 33.81,
+      "predictedDecision": "LOCAL",
+      "estimatedLocalMs": 0.33,
+      "estimatedSwarmMs": 7.42
+    },
+    {
+      "resolution": "64x64",
+      "width": 64,
+      "height": 64,
+      "payloadBytes": 16384,
+      "pilMedianMs": 0.438,
+      "pilP95Ms": 1.733,
+      "throughputMBs": 35.69,
+      "predictedDecision": "LOCAL",
+      "estimatedLocalMs": 1.3,
+      "estimatedSwarmMs": 8.7
+    },
+    {
+      "resolution": "128x128",
+      "width": 128,
+      "height": 128,
+      "payloadBytes": 65536,
+      "pilMedianMs": 0.683,
+      "pilP95Ms": 2.035,
+      "throughputMBs": 91.48,
+      "predictedDecision": "LOCAL",
+      "estimatedLocalMs": 5.21,
+      "estimatedSwarmMs": 13.79
+    },
+    {
+      "resolution": "256x256",
+      "width": 256,
+      "height": 256,
+      "payloadBytes": 262144,
+      "pilMedianMs": 3.207,
+      "pilP95Ms": 6.543,
+      "throughputMBs": 77.96,
+      "predictedDecision": "LOCAL",
+      "estimatedLocalMs": 20.83,
+      "estimatedSwarmMs": 34.14
+    },
+    {
+      "resolution": "512x512",
+      "width": 512,
+      "height": 512,
+      "payloadBytes": 1048576,
+      "pilMedianMs": 25.485,
+      "pilP95Ms": 41.824,
+      "throughputMBs": 39.24,
+      "predictedDecision": "LOCAL",
+      "estimatedLocalMs": 83.33,
+      "estimatedSwarmMs": 115.57
+    },
+    {
+      "resolution": "1024x1024",
+      "width": 1024,
+      "height": 1024,
+      "payloadBytes": 4194304,
+      "pilMedianMs": 298.384,
+      "pilP95Ms": 397.751,
+      "throughputMBs": 13.41,
+      "predictedDecision": "LOCAL",
+      "estimatedLocalMs": 333.33,
+      "estimatedSwarmMs": 441.29
+    },
+    {
+      "resolution": "2048x2048",
+      "width": 2048,
+      "height": 2048,
+      "payloadBytes": 16777216,
+      "pilMedianMs": 5112.661,
+      "pilP95Ms": 5140.087,
+      "throughputMBs": 3.13,
+      "predictedDecision": "LOCAL",
+      "estimatedLocalMs": 1333.33,
+      "estimatedSwarmMs": 1744.14
+    }
+  ],
+  "componentOverheads": {
+    "workloadIrConstructionMs": 0.0025,
+    "base64Encode1MbMs": 1.258,
+    "base64Decode1MbMs": 1.968,
+    "pilImageFrombytes1MbMs": 0.392,
+    "totalPrePostOverhead1MbMs": 3.621
+  }
+}
