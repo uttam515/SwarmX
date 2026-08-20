@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package swarmx.v1;
+
+import "swarmx/v1/task.proto";
+import "swarmx/v1/capability.proto";
+import "swarmx/v1/pairing.proto";
+
+message EncryptedEnvelope {
+  string session_id = 1;
+  int64 sequence_num = 2;
+  bytes iv_nonce = 3; // 12-byte IV for AES-GCM
+  bytes ciphertext = 4;
+  bytes auth_tag = 5; // 16-byte MAC tag
+}
+
+message TelemetryAck {
+  int64 server_time_ms = 1;
+  bool is_eligible = 2;
+}
+
+message TaskResult {
+  string task_id = 1;
+  TaskStatus status = 2;
+  bytes output_data = 3;
+  string error_message = 4;
+  int64 execution_time_ms = 5;
+}
+
+service SwarmXWorkerService {
+  // Pairing & Trust Management
+  rpc InitiatePairing(PairingInitRequest) returns (PairingInitResponse);
+  rpc ConfirmPairing(PairingConfirmRequest) returns (PairingConfirmResponse);
+  rpc RevokeTrust(RevocationRequest) returns (RevocationResponse);
+
+  // Secure Telemetry & Heartbeat (Encrypted session envelope)
+  rpc StreamTelemetry(stream EncryptedEnvelope) returns (stream EncryptedEnvelope);
+
+  // Task Assignment & Execution (Encrypted session envelope)
+  rpc ExecuteTask(EncryptedEnvelope) returns (EncryptedEnvelope);
+}

@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# SwarmX Developer Launcher & Control CLI
+
+set -e
+
+SWARMX_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export PYTHONPATH="$SWARMX_ROOT/sdk/python:$PYTHONPATH"
+
+COMMAND="${1:-status}"
+
+case "$COMMAND" in
+  start)
+    echo "🐝 Starting SwarmX Core Daemon on Host..."
+    cd "$SWARMX_ROOT/core"
+    exec npm start
+    ;;
+
+  worker)
+    echo "🍏 Starting SwarmX Native macOS Worker..."
+    cd "$SWARMX_ROOT/worker-macos"
+    exec swift run swarmx-worker "$@"
+    ;;
+
+  doctor)
+    echo "🩺 Running SwarmX Diagnostics..."
+    python3 -m swarmx.doctor
+    ;;
+
+  benchmark)
+    echo "⚡ Running SwarmX Cost Calibration Benchmark..."
+    python3 -m swarmx.benchmark
+    ;;
+
+  demo)
+    echo "🚀 Running Flagship Demo (Unmodified Python Application)..."
+    SWARMX_DEBUG=1 python3 "$SWARMX_ROOT/examples/flagship_demo.py"
+    ;;
+
+  status)
+    if [ -S "/tmp/swarmx.sock" ]; then
+      echo "🟢 SwarmX Core is running at /tmp/swarmx.sock"
+      python3 -m swarmx.doctor
+    else
+      echo "⚪ SwarmX Core is offline. Start with: ./bin/swarmx start"
+    fi
+    ;;
+
+  test)
+    echo "🧪 Running SwarmX Full Regression Suite..."
+    (cd "$SWARMX_ROOT/worker-macos" && swift test)
+    (cd "$SWARMX_ROOT/sdk/python" && python3 -m unittest discover -s tests)
+    (cd "$SWARMX_ROOT/core" && npm test)
+    ;;
+
+  *)
+    echo "SwarmX Developer Control CLI"
+    echo "Usage: ./bin/swarmx {start|worker|doctor|benchmark|demo|status|test}"
+    exit 1
+    ;;
+esac

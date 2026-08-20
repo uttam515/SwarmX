@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package swarmx.v1;
+
+enum TaskStatus {
+  TASK_STATUS_UNSPECIFIED = 0;
+  TASK_STATUS_PENDING = 1;
+  TASK_STATUS_ASSIGNED = 2;
+  TASK_STATUS_RUNNING = 3;
+  TASK_STATUS_COMPLETED = 4;
+  TASK_STATUS_ABANDONED = 5;
+  TASK_STATUS_FAILED = 6;
+}
+
+message TaskResources {
+  int32 min_cpu_cores = 1;
+  int64 min_ram_mb = 2;
+  bool requires_gpu = 3;
+  float min_battery_level = 4; // e.g. 0.20 for 20%
+}
+
+message TaskAttempt {
+  int64 timestamp_ms = 1;
+  string worker_id = 2;
+  TaskStatus previous_status = 3;
+  string reason = 4; // e.g., "HOST_CRASH_RECOVERY", "WORKER_DISCONNECTED", "EXECUTION_ERROR"
+}
+
+message Task {
+  string id = 1; // UUID v4
+  string input_ref = 2; // Data URI, file path, or object storage hash
+  bytes computation_descriptor = 3; // Serialized execution payload/instruction
+  TaskResources required_resources = 4;
+  repeated string dependencies = 5; // Parent task IDs forming DAG
+  map<string, string> execution_constraints = 6; // e.g. os_type, arch
+  string result_destination = 7; // Output destination URI/path
+  int32 retry_count = 8;
+  repeated TaskAttempt attempt_history = 9;
+  TaskStatus status = 10;
+  string assigned_worker_id = 11;
+  int64 created_at_ms = 12;
+  int64 updated_at_ms = 13;
+}

@@ -1,0 +1,47 @@
+syntax = "proto3";
+
+package swarmx.v1;
+
+import "swarmx/v1/capability.proto";
+
+message PairingInitRequest {
+  string host_device_id = 1;
+  string host_device_name = 2;
+  bytes host_ephemeral_pubkey = 3; // X25519 32-byte public key
+  bytes host_nonce = 4; // 16-byte random nonce
+}
+
+message PairingInitResponse {
+  string worker_device_id = 1;
+  string worker_device_name = 2;
+  bytes worker_ephemeral_pubkey = 3; // X25519 32-byte public key
+  bytes worker_salt = 4; // 16-byte salt for HKDF
+  string comparison_code = 5; // Derived SAS code (e.g. 4-digit / emoji string)
+  CapabilityProfile capability_profile = 6;
+}
+
+message PairingConfirmRequest {
+  string host_device_id = 1;
+  string worker_device_id = 2;
+  string confirmed_comparison_code = 3; // Host confirms matching code
+  bytes auth_tag = 4; // HMAC/AEAD verification tag over handshake transcript
+}
+
+message PairingConfirmResponse {
+  bool allowed = 1; // Worker user tapped Allow / Confirmed
+  string session_id = 2;
+  int64 session_expires_at_ms = 3;
+  string error_message = 4;
+}
+
+message RevocationRequest {
+  string initiator_device_id = 1; // Host or Worker ID initiating revocation
+  string target_device_id = 2;
+  string reason = 3;
+  int64 timestamp_ms = 4;
+}
+
+message RevocationResponse {
+  bool success = 1;
+  string message = 2;
+}

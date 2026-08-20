@@ -1,0 +1,52 @@
+# OS / IDE
+.DS_Store
+.vscode/
+*.swp
+*.swo
+
+# Node / TypeScript
+node_modules/
+dist/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Swift / Xcode
+.build/
+.swiftpm/
+Packages/
+*.xcodeproj
+*.xcworkspace
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+build/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Runtime & Databases
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sock
+*.log
+/tmp/
