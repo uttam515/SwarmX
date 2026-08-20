@@ -71,6 +71,36 @@ final class SwarmXWorkerTests: XCTestCase {
         XCTAssertEqual(String(data: decrypted, encoding: .utf8), "Sensitive Telemetry Payload")
     }
 
+    func testConcurrentEncryptionSequenceMonotonicity() throws {
+        let key = SymmetricKey(size: .bits256)
+        PairingManager.shared.activateSession(sessionId: "test-concurrent-seq", hostToWorkerKey: key, workerToHostKey: key)
+
+        let count = 100
+        let group = DispatchGroup()
+        let lock = NSLock()
+        var sequenceNumbers = [Int64]()
+
+        for i in 0..<count {
+            group.enter()
+            DispatchQueue.global().async {
+                let payload = "Payload-\(i)".data(using: .utf8)!
+                if let env = try? PairingManager.shared.encryptEnvelope(payload: payload) {
+                    lock.lock()
+                    sequenceNumbers.append(env.sequenceNum)
+                    lock.unlock()
+                }
+                group.leave()
+            }
+        }
+
+        group.wait()
+
+        XCTAssertEqual(sequenceNumbers.count, count)
+        let uniqueSeq = Set(sequenceNumbers)
+        XCTAssertEqual(uniqueSeq.count, count, "All sequence numbers must be strictly unique")
+        XCTAssertEqual(sequenceNumbers.sorted(), Array(1...Int64(count)), "Sequence numbers must span exactly 1 to \(count) with no gaps or duplicates")
+    }
+
     func testDirectionalKeySeparationAndCrossDecryptionRejection() throws {
         let hostDeviceId = "swarmx-host"
         let workerDeviceId = "test-worker-directional"

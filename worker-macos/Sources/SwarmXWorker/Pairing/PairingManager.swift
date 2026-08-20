@@ -20,12 +20,15 @@ public class PairingManager {
     public private(set) var hostToWorkerKey: SymmetricKey?
     public private(set) var workerToHostKey: SymmetricKey?
     private var sequenceNum: UInt64 = 0
+    private let lock = NSLock()
 
     private let trustStoreKey = "SwarmXTrustedHost"
 
     private init() {}
 
     public func generateEphemeralKeypair() -> (publicKeyHex: String, saltHex: String) {
+        self.lock.lock()
+        defer { self.lock.unlock() }
         let privateKey = Curve25519.KeyAgreement.PrivateKey()
         self.ephemeralPrivateKey = privateKey
         var randomSalt = Data(count: 16)
@@ -36,6 +39,8 @@ public class PairingManager {
     }
 
     public var ephemeralPublicKeyHex: String {
+        self.lock.lock()
+        defer { self.lock.unlock() }
         return ephemeralPrivateKey?.publicKey.rawRepresentation.hexString ?? ""
     }
 
@@ -64,6 +69,9 @@ public class PairingManager {
     }
 
     public func computeSharedSecretAndSas(hostPublicKeyHex: String, hostDeviceId: String = "swarmx-host", workerDeviceId: String = "worker") throws -> String {
+        self.lock.lock()
+        defer { self.lock.unlock() }
+
         guard let privateKey = ephemeralPrivateKey else {
             throw NSError(domain: "SwarmX", code: 1, userInfo: [NSLocalizedDescriptionKey: "No ephemeral key"])
         }
@@ -74,7 +82,7 @@ public class PairingManager {
         }
 
         let sharedSecret = try privateKey.sharedSecretFromKeyAgreement(with: hostPublicKey)
-        let sasContext = "swarmx-sas-v1:\(hostDeviceId):\(workerDeviceId):\(hostPublicKeyHex):\(self.ephemeralPublicKeyHex)"
+        let sasContext = "swarmx-sas-v1:\(hostDeviceId):\(workerDeviceId):\(hostPublicKeyHex):\(privateKey.publicKey.rawRepresentation.hexString)"
         let sasCode = PairingManager.deriveSasCode(sharedSecret: sharedSecret, salt: self.salt, contextInfo: sasContext)
         self.derivedSasCode = sasCode
 
@@ -87,6 +95,8 @@ public class PairingManager {
     }
 
     public func activateSession(sessionId: String, hostToWorkerKey: SymmetricKey? = nil, workerToHostKey: SymmetricKey? = nil) {
+        self.lock.lock()
+        defer { self.lock.unlock() }
         self.activeSessionId = sessionId
         if let h2w = hostToWorkerKey { self.hostToWorkerKey = h2w }
         if let w2h = workerToHostKey { 
@@ -102,6 +112,8 @@ public class PairingManager {
     }
 
     public func revokeTrust() {
+        self.lock.lock()
+        defer { self.lock.unlock() }
         UserDefaults.standard.removeObject(forKey: trustStoreKey)
         self.activeSessionId = nil
         self.activeSessionKey = nil
@@ -111,6 +123,9 @@ public class PairingManager {
     }
 
     public func encryptEnvelope(payload: Data) throws -> EncryptedEnvelope {
+        self.lock.lock()
+        defer { self.lock.unlock() }
+
         guard let key = workerToHostKey ?? activeSessionKey, let sessionId = activeSessionId else {
             throw NSError(domain: "SwarmX", code: 3, userInfo: [NSLocalizedDescriptionKey: "No active session"])
         }
@@ -133,6 +148,9 @@ public class PairingManager {
     }
 
     public func decryptEnvelope(envelope: EncryptedEnvelope) throws -> Data {
+        self.lock.lock()
+        defer { self.lock.unlock() }
+
         guard let key = hostToWorkerKey ?? activeSessionKey else {
             throw NSError(domain: "SwarmX", code: 4, userInfo: [NSLocalizedDescriptionKey: "No active session"])
         }

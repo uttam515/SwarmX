@@ -322,26 +322,31 @@ public class SwarmClient {
                let taskPayload = try? JSONDecoder().decode(TaskPayload.self, from: decryptedData) {
                 
                 print("⚙️ Executing Task [\(taskPayload.taskId)] (Kernel: \(taskPayload.computationDescriptor))...")
-                let resultPayload = ImageProcessingKernel.shared.processTask(payload: taskPayload)
-                
-                if let resultData = try? JSONEncoder().encode(resultPayload),
-                   let resultEnvelope = try? PairingManager.shared.encryptEnvelope(payload: resultData) {
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    guard let self = self else { return }
+                    let resultPayload = ImageProcessingKernel.shared.processTask(payload: taskPayload)
+                    guard let resultData = try? JSONEncoder().encode(resultPayload) else { return }
                     
-                    let envDict: [String: Any] = [
-                        "sessionId": resultEnvelope.sessionId,
-                        "sequenceNum": resultEnvelope.sequenceNum,
-                        "ivNonce": resultEnvelope.ivNonce,
-                        "ciphertext": resultEnvelope.ciphertext,
-                        "authTag": resultEnvelope.authTag
-                    ]
-                    let msg: [String: Any] = [
-                        "type": "TASK_RESULT",
-                        "workerDeviceId": self.deviceId,
-                        "taskId": taskPayload.taskId,
-                        "envelope": envDict
-                    ]
-                    self.send(json: msg)
-                    print("✅ Completed & Sent Result for Task [\(taskPayload.taskId)] (\(resultPayload.executionTimeMs)ms)")
+                    // Strictly serialize encryption and wire transmission on the dedicated network queue
+                    self.queue.async {
+                        guard let resultEnvelope = try? PairingManager.shared.encryptEnvelope(payload: resultData) else { return }
+                        
+                        let envDict: [String: Any] = [
+                            "sessionId": resultEnvelope.sessionId,
+                            "sequenceNum": resultEnvelope.sequenceNum,
+                            "ivNonce": resultEnvelope.ivNonce,
+                            "ciphertext": resultEnvelope.ciphertext,
+                            "authTag": resultEnvelope.authTag
+                        ]
+                        let msg: [String: Any] = [
+                            "type": "TASK_RESULT",
+                            "workerDeviceId": self.deviceId,
+                            "taskId": taskPayload.taskId,
+                            "envelope": envDict
+                        ]
+                        self.send(json: msg)
+                        print("✅ Completed & Sent Result for Task [\(taskPayload.taskId)] (\(resultPayload.executionTimeMs)ms)")
+                    }
                 }
             }
 
@@ -371,20 +376,23 @@ public class SwarmClient {
     }
 
     public func sendTelemetryReport() {
-        guard PairingManager.shared.activeSessionId != nil else { return }
-        let telemetry = TelemetryProvider.shared.collectTelemetry(deviceId: self.deviceId)
-        guard let telemetryData = try? JSONEncoder().encode(telemetry),
-              let envelope = try? PairingManager.shared.encryptEnvelope(payload: telemetryData) else { return }
+        self.queue.async { [weak self] in
+            guard let self = self else { return }
+            guard PairingManager.shared.activeSessionId != nil else { return }
+            let telemetry = TelemetryProvider.shared.collectTelemetry(deviceId: self.deviceId)
+            guard let telemetryData = try? JSONEncoder().encode(telemetry),
+                  let envelope = try? PairingManager.shared.encryptEnvelope(payload: telemetryData) else { return }
 
-        let envData = try! JSONEncoder().encode(envelope)
-        let envDict = try! JSONSerialization.jsonObject(with: envData) as! [String: Any]
+            let envData = try! JSONEncoder().encode(envelope)
+            let envDict = try! JSONSerialization.jsonObject(with: envData) as! [String: Any]
 
-        let msg: [String: Any] = [
-            "type": "ENCRYPTED_TELEMETRY",
-            "deviceId": self.deviceId,
-            "envelope": envDict
-        ]
-        self.send(json: msg)
+            let msg: [String: Any] = [
+                "type": "ENCRYPTED_TELEMETRY",
+                "deviceId": self.deviceId,
+                "envelope": envDict
+            ]
+            self.send(json: msg)
+        }
     }
 
     public func revoke() {

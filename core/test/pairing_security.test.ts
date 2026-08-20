@@ -681,4 +681,47 @@ describe('Pairing, Transport Security & Hardening Tests', () => {
     // Asserts socket file was cleaned up
     expect(fs.existsSync(testSocketPath)).to.be.false;
   });
+
+  it('Monotonic Sequence Number Invariant: 100+ sequential encrypted messages succeed and out-of-order/replayed are rejected', () => {
+    const workerDeviceId = 'worker-seq-100';
+    const hostInit = pairingService.createPairingInitiation(workerDeviceId);
+    const workerKeypair = crypto.generateKeyPairSync('x25519');
+    const workerPublicKeyHex = workerKeypair.publicKey.export({ type: 'spki', format: 'der' }).subarray(-32).toString('hex');
+    const salt = crypto.randomBytes(16);
+
+    const { comparisonCode } = pairingService.processWorkerHandshake(hostInit.initiationId, workerDeviceId, workerPublicKeyHex, salt.toString('hex'));
+    const session = pairingService.confirmPairing(workerDeviceId, 'Worker Seq', workerPublicKeyHex, comparisonCode);
+
+    const createWorkerEnvelope = (seq: number, msg: string) => {
+      const iv = Buffer.alloc(12);
+      session.ivSalt.copy(iv, 0, 0, 4);
+      iv.writeBigUInt64BE(BigInt(seq), 4);
+      const cipher = crypto.createCipheriv('aes-256-gcm', session.workerToHostKey, iv);
+      cipher.setAAD(Buffer.from(`${session.sessionId}:${seq}`, 'utf-8'));
+      const ciphertext = Buffer.concat([cipher.update(Buffer.from(msg, 'utf-8')), cipher.final()]);
+      return {
+        sessionId: session.sessionId,
+        sequenceNum: seq,
+        ivNonce: iv.toString('base64'),
+        ciphertext: ciphertext.toString('base64'),
+        authTag: cipher.getAuthTag().toString('base64')
+      };
+    };
+
+    // 1. Send 100 sequential messages
+    for (let i = 1; i <= 100; i++) {
+      const env = createWorkerEnvelope(i, `Message-${i}`);
+      const decrypted = pairingService.decryptEnvelope(env);
+      expect(decrypted.toString('utf-8')).to.equal(`Message-${i}`);
+    }
+
+    // 2. Out-of-order / replay of past sequence number (e.g. 97 after 100) MUST throw replay error
+    const replayedEnv97 = createWorkerEnvelope(97, 'Message-97-Late');
+    expect(() => pairingService.decryptEnvelope(replayedEnv97)).to.throw(/Replay attack detected: Incoming sequenceNum 97 <= lastReceived 100/);
+
+    // 3. Subsequent valid monotonic sequence number (101) MUST succeed
+    const validEnv101 = createWorkerEnvelope(101, 'Message-101');
+    const decrypted101 = pairingService.decryptEnvelope(validEnv101);
+    expect(decrypted101.toString('utf-8')).to.equal('Message-101');
+  });
 });
