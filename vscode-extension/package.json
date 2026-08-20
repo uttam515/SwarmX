@@ -1,0 +1,102 @@
+{
+  "name": "swarmx-vscode",
+  "displayName": "SwarmX Distributed Runtime",
+  "description": "Developer-facing distributed execution runtime for VS Code",
+  "version": "0.1.0",
+  "publisher": "swarmx",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "swarmx-sidebar",
+          "title": "SwarmX",
+          "icon": "$(server-process)"
+        }
+      ]
+    },
+    "views": {
+      "swarmx-sidebar": [
+        {
+          "id": "swarmx.workersView",
+          "name": "Connected Swarm Workers"
+        },
+        {
+          "id": "swarmx.discoveredView",
+          "name": "Discovered Nearby Devices"
+        },
+        {
+          "id": "swarmx.tasksView",
+          "name": "Swarm Tasks"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "swarmx.connectWorker",
+        "title": "Connect / Pair Worker",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "swarmx.revokeWorker",
+        "title": "Revoke Worker Trust",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "swarmx.toggleSwarm",
+        "title": "Toggle Swarm Distributed Execution",
+        "icon": "$(pulse)"
+      },
+      {
+        "command": "swarmx.refresh",
+        "title": "Refresh Swarm State",
+        "icon": "$(refresh)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "swarmx.refresh",
+          "when": "view == swarmx.workersView",
+          "group": "navigation"
+        },
+        {
+          "command": "swarmx.toggleSwarm",
+          "when": "view == swarmx.workersView",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "swarmx.connectWorker",
+          "when": "view == swarmx.discoveredView",
+          "group": "inline"
+        },
+        {
+          "command": "swarmx.revokeWorker",
+          "when": "view == swarmx.workersView",
+          "group": "inline"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.19",
+    "@types/vscode": "^1.80.0",
+    "typescript": "^5.7.3"
+  }
+}
