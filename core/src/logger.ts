@@ -66,6 +66,14 @@ export class Logger {
     this.logWithTag('WORKER STATE', message);
   }
 
+  public static execution(message: string): void {
+    this.logWithTag('EXECUTION', message);
+  }
+
+  public static validation(message: string): void {
+    this.logWithTag('VALIDATION', message);
+  }
+
   public static error(message: string): void {
     this.logWithTag('ERROR', message);
   }

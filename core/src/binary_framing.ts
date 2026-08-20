@@ -18,6 +18,14 @@ export interface DecodedBinaryFrame {
  * [ 4-byte magic (SWRM) | 4-byte JSON length (BE) | JSON UTF-8 bytes | Raw Payload Bytes ]
  */
 export function encodeBinaryFrame(metadata: any, payload: Buffer): Buffer {
+  if (metadata && typeof metadata === 'object') {
+    if (metadata.result && typeof metadata.result === 'object') {
+      metadata.result.totalPayloadBytes = payload.length;
+    } else {
+      metadata.totalPayloadBytes = payload.length;
+    }
+  }
+
   const jsonBuf = Buffer.from(JSON.stringify(metadata), 'utf-8');
   if (jsonBuf.length > MAX_JSON_HEADER_SIZE) {
     throw new Error(`JSON metadata size ${jsonBuf.length} exceeds maximum allowed limit ${MAX_JSON_HEADER_SIZE}`);
@@ -67,7 +75,15 @@ export function decodeBinaryFrame(buffer: Buffer): DecodedBinaryFrame | null {
     throw new Error(`Malformed binary frame metadata: ${err}`);
   }
 
-  const declaredPayload = metadata?.data?.totalPayloadBytes ?? metadata?.totalPayloadBytes;
+  const declaredPayload =
+    metadata?.totalPayloadBytes ??
+    metadata?.result?.totalPayloadBytes ??
+    metadata?.params?.workload?.data?.totalPayloadBytes ??
+    metadata?.params?.workload?.totalPayloadBytes ??
+    metadata?.params?.totalPayloadBytes ??
+    metadata?.workload?.data?.totalPayloadBytes ??
+    metadata?.data?.totalPayloadBytes;
+
   if (declaredPayload !== undefined && (declaredPayload < 0 || declaredPayload > MAX_PAYLOAD_SIZE)) {
     throw new Error(`Oversized or negative payload declared in binary frame: ${declaredPayload} bytes`);
   }

@@ -83,6 +83,8 @@ def print_progress(completed: int, total: int, bar_length: int = 20):
             print(f"  [{bar}] 100% ({completed:,}/{total:,})")
 
 def main():
+    force_swarm = "--force-swarm" in sys.argv
+
     num_images = 1000
     dim = (128, 128) # 128x128 RGBA = 65,536 bytes per item (Total = 65.5 MB)
     total_bytes = num_images * dim[0] * dim[1] * 4
@@ -104,8 +106,6 @@ def main():
     print("\nCluster")
     if core_online:
         print("  Core:          ● ONLINE")
-        active_cnt = status.get("activeWorkerCount", len(connected_workers))
-        eligible_cnt = status.get("eligibleWorkerCount", 0)
         print("  Workers:")
         print("    Local Host:  ● READY")
         if len(connected_workers) > 0:
@@ -123,42 +123,76 @@ def main():
         print("    Local Host:  ● READY")
         print("    Remote:      0")
 
-    # 3. Decision Model
+    # 3. Handle --force-swarm Verification
+    eligible_remote_workers = [w for w in connected_workers if w.get("isEligible", True)]
+    if force_swarm:
+        if not core_online:
+            print("\n❌ ERROR: --force-swarm requested but SwarmX Core is OFFLINE.")
+            sys.exit(1)
+        if len(eligible_remote_workers) == 0:
+            print("\n❌ ERROR: --force-swarm requested but no eligible remote worker is available.")
+            sys.exit(1)
+
+    # 4. Decision Model
     decision_info = evaluate_cost_model(total_bytes) if core_online else None
     print("\nDecision")
-    if decision_info:
-        loc_est = decision_info.get("estimatedLocalTimeMs", "N/A")
-        swm_est = decision_info.get("estimatedSwarmTimeMs", "N/A")
-        dec = decision_info.get("decision", "LOCAL")
-        loc_str = f"{loc_est} ms" if isinstance(loc_est, (int, float)) and loc_est < 100000 else "N/A"
-        swm_str = f"{swm_est} ms" if isinstance(swm_est, (int, float)) and swm_est < 100000 else "N/A"
-        print(f"  Local estimate:    {loc_str}")
-        print(f"  Swarm estimate:    {swm_str}")
-        print(f"  Decision:          {'SWARM' if dec == 'SWARM' else 'LOCAL FALLBACK'}")
-        print(f"  Reason:            {decision_info.get('reason', 'N/A')}")
+    if force_swarm:
+        first_worker = eligible_remote_workers[0]
+        remote_name = first_worker.get("capabilityProfile", {}).get("deviceName", first_worker.get("deviceId", "Remote Mac"))
+        gpu_str = " [⚡ GPU]" if first_worker.get("capabilityProfile", {}).get("hasGpu") else ""
+        
+        cost_rec = decision_info.get("decision", "LOCAL") if decision_info else "LOCAL"
+        cost_reason = decision_info.get("reason", "N/A") if decision_info else "Core offline"
+        print(f"  Cost model recommendation: {cost_rec}")
+        print(f"  Reason:                    {cost_reason}")
+        print(f"\n  Demo execution mode:       FORCED SWARM")
+        print(f"  Remote worker:             {remote_name}{gpu_str}")
+        os.environ["SWARMX_FORCE_SWARM"] = "1"
     else:
-        print("  Local estimate:    N/A")
-        print("  Swarm estimate:    N/A")
-        print("  Decision:          LOCAL FALLBACK")
-        print("  Reason:            No eligible remote worker (in-process PIL execution)")
+        if decision_info:
+            loc_est = decision_info.get("estimatedLocalTimeMs", "N/A")
+            swm_est = decision_info.get("estimatedSwarmTimeMs", "N/A")
+            dec = decision_info.get("decision", "LOCAL")
+            loc_str = f"{loc_est} ms" if isinstance(loc_est, (int, float)) and loc_est < 100000 else "N/A"
+            swm_str = f"{swm_est} ms" if isinstance(swm_est, (int, float)) and swm_est < 100000 else "N/A"
+            print(f"  Local estimate:    {loc_str}")
+            print(f"  Swarm estimate:    {swm_str}")
+            print(f"  Decision:          {'SWARM' if dec == 'SWARM' else 'LOCAL FALLBACK'}")
+            print(f"  Reason:            {decision_info.get('reason', 'N/A')}")
+        else:
+            print("  Local estimate:    N/A")
+            print("  Swarm estimate:    N/A")
+            print("  Decision:          LOCAL FALLBACK")
+            print("  Reason:            No eligible remote worker (in-process PIL execution)")
 
-    # 4. Data Preparation & Execution
+    # 5. Data Preparation & Execution
     base_data = np.full((dim[1], dim[0], 4), 140, dtype=np.uint8)
     sample_image = Image.fromarray(base_data, mode="RGBA")
 
     print("\nExecution")
+    if force_swarm:
+        print(f"  Mode:           SWARM")
+        print(f"  Remote worker:  {remote_name}{gpu_str}")
+    else:
+        dec_mode = "SWARM" if (decision_info and decision_info.get("decision") == "SWARM") else "LOCAL FALLBACK"
+        print(f"  Mode:           {dec_mode}")
+
     t0 = time.perf_counter()
     processed_results = []
     
     # Progress step interval
     step = max(1, num_images // 20)
 
-    for i in range(num_images):
-        # Pure unmodified PIL filter call — intercepted transparently by SwarmX
-        filtered = sample_image.filter(ImageFilter.BoxBlur(radius=2))
-        processed_results.append(filtered)
-        if (i + 1) % step == 0 or (i + 1) == num_images:
-            print_progress(i + 1, num_images)
+    try:
+        for i in range(num_images):
+            # Pure unmodified PIL filter call — intercepted transparently by SwarmX
+            filtered = sample_image.filter(ImageFilter.BoxBlur(radius=2))
+            processed_results.append(filtered)
+            if (i + 1) % step == 0 or (i + 1) == num_images:
+                print_progress(i + 1, num_images)
+    except Exception as e:
+        print(f"\n❌ Execution Error: {e}")
+        sys.exit(1)
 
     elapsed_s = time.perf_counter() - t0
     elapsed_ms = elapsed_s * 1000
@@ -166,7 +200,7 @@ def main():
     print("  Failed:          0")
     print("  Retries:         0")
 
-    # 5. Validation
+    # 6. Validation
     first_result = processed_results[0]
     is_valid_type = isinstance(first_result, Image.Image)
     pixel_sample = first_result.getpixel((dim[0] // 2, dim[1] // 2)) if is_valid_type else None
@@ -176,12 +210,16 @@ def main():
     print(f"  Pixel tolerance: {'PASS (Δ <= 2, MSE <= 0.5)' if pixel_pass else 'FAIL'}")
     print(f"  Output integrity:{'PASS (100% authentic PIL.Image.Image)' if is_valid_type else 'FAIL'}")
 
-    # 6. Result Statistics
+    # 7. Result Statistics
     items_per_sec = num_images / elapsed_s if elapsed_s > 0 else 0
     mb_per_sec = payload_mb / elapsed_s if elapsed_s > 0 else 0
 
     print("\nResult")
     print("  Status:          SUCCESS")
+    if force_swarm or (decision_info and decision_info.get("decision") == "SWARM"):
+        print(f"  Execution:       PHYSICAL REMOTE WORKER ({remote_name})")
+    else:
+        print("  Execution:       LOCAL IN-PROCESS ENGINE")
     print(f"  Total time:      {elapsed_ms:.1f} ms ({elapsed_s:.3f} s)")
     print(f"  Throughput:      {items_per_sec:,.1f} items/s ({mb_per_sec:.2f} MB/s)")
 

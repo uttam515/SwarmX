@@ -7,7 +7,7 @@ class SwarmClient:
     """
     SwarmX Core IPC Client for communicating over the local Unix domain socket (/tmp/swarmx.sock).
     """
-    def __init__(self, socket_path: str = "/tmp/swarmx.sock", timeout: float = 5.0):
+    def __init__(self, socket_path: str = "/tmp/swarmx.sock", timeout: float = 30.0):
         self.socket_path = socket_path
         self.timeout = timeout
         self.sock: Optional[socket.socket] = None
@@ -69,10 +69,10 @@ class SwarmClient:
     def evaluate_workload(self, workload: Dict[str, Any]) -> Dict[str, Any]:
         return self.request("evaluateWorkload", {"workload": workload})
 
-    def execute_workload(self, workload: Dict[str, Any]) -> Dict[str, Any]:
-        return self.request("executeWorkload", {"workload": workload})
+    def execute_workload(self, workload: Dict[str, Any], force_swarm: bool = False) -> Dict[str, Any]:
+        return self.request("executeWorkload", {"workload": workload, "forceSwarm": force_swarm})
 
-    def execute_workload_binary(self, workload_metadata: Dict[str, Any], raw_payload_bytes: bytes) -> tuple:
+    def execute_workload_binary(self, workload_metadata: Dict[str, Any], raw_payload_bytes: bytes, force_swarm: bool = False) -> tuple:
         """
         Milestone 2.1 Zero-Copy Binary Workload Execution:
         Transfers raw binary planar bytes without Base64 encoding.
@@ -95,7 +95,8 @@ class SwarmClient:
         msg = {
             "id": req_id,
             "method": "executeWorkload",
-            "params": {"workload": workload_metadata}
+            "params": {"workload": workload_metadata, "forceSwarm": force_swarm},
+            "totalPayloadBytes": len(raw_payload_bytes)
         }
 
         json_bytes = json.dumps(msg).encode("utf-8")

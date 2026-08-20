@@ -13,10 +13,10 @@ def get_swarm_client(socket_path: str = "/tmp/swarmx.sock") -> SwarmClient:
     global _GLOBAL_CLIENT
     env_sock = os.environ.get("SWARMX_IPC_PATH", socket_path)
     if _GLOBAL_CLIENT is None:
-        _GLOBAL_CLIENT = SwarmClient(socket_path=env_sock, timeout=5.0)
+        _GLOBAL_CLIENT = SwarmClient(socket_path=env_sock, timeout=30.0)
     elif _GLOBAL_CLIENT.socket_path != env_sock:
         _GLOBAL_CLIENT.close()
-        _GLOBAL_CLIENT = SwarmClient(socket_path=env_sock, timeout=5.0)
+        _GLOBAL_CLIENT = SwarmClient(socket_path=env_sock, timeout=30.0)
     return _GLOBAL_CLIENT
 
 def is_certified_box_blur(filter_spec) -> bool:
@@ -85,25 +85,31 @@ def swarmx_image_filter(self: Image.Image, filter_spec) -> Image.Image:
             }
         }
 
+        force_swarm = os.environ.get("SWARMX_FORCE_SWARM") == "1"
+
         # 5. Evaluate Workload with Core Decision Engine
         eval_res = client.evaluate_workload(workload_ir)
         decision = eval_res.get("decision")
         if debug:
             print(f"🔍 [SwarmX Decision] Evaluated: {decision} (Reason: {eval_res.get('reason')})")
 
-        if decision != "SWARM":
+        if decision != "SWARM" and not force_swarm:
             # Local decision -> execute original PIL in-process
             return _ORIGINAL_PIL_FILTER(self, filter_spec)
 
-        # 6. SWARM Decision: Dispatch through Zero-Copy Binary Execution Path (Milestone 2.1)
+        # 6. SWARM / FORCED SWARM Decision: Dispatch through Zero-Copy Binary Execution Path (Milestone 2.1)
         if debug:
             print("🚀 [SwarmX Execution] Dispatching zero-copy binary workload to SwarmX Core...")
 
-        exec_res, output_bytes = client.execute_workload_binary(workload_ir, raw_bytes)
+        exec_res, output_bytes = client.execute_workload_binary(workload_ir, raw_bytes, force_swarm=force_swarm)
         if exec_res.get("status") == "COMPLETED" and len(output_bytes) == payload_bytes:
             if debug:
                 print("✅ [SwarmX Execution] Received valid binary buffer from Swarm -> reconstructing PIL.Image.Image")
             return Image.frombytes(mode, (width, height), output_bytes)
+
+        if force_swarm:
+            # In forced demo mode, fail clearly if remote execution fails rather than silently falling back
+            raise RuntimeError(f"ERROR: Forced Swarm execution failed: {exec_res.get('reason', 'Remote worker execution error')}")
 
         # Execution returned fallback or validation failure -> fail closed
         if debug:
@@ -111,6 +117,8 @@ def swarmx_image_filter(self: Image.Image, filter_spec) -> Image.Image:
         return _ORIGINAL_PIL_FILTER(self, filter_spec)
 
     except Exception as e:
+        if force_swarm:
+            raise
         if os.environ.get("SWARMX_DEBUG") == "1":
             print(f"⚠️ [SwarmX Error] Exception during interception: {e} -> falling back to original PIL")
         return _ORIGINAL_PIL_FILTER(self, filter_spec)

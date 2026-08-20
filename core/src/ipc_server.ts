@@ -11,6 +11,7 @@ import { DistributionDecisionEngine } from './decision_engine';
 import { KernelRegistry } from './kernel_registry';
 import { BINARY_FRAME_MAGIC, encodeBinaryFrame, decodeBinaryFrame } from './binary_framing';
 import { Task, TaskStatus, WorkloadDescriptor } from './types';
+import { Logger } from './logger';
 
 export interface IpcMessage {
   id: string | number;
@@ -285,7 +286,7 @@ export class IpcServer {
         }
 
         case 'executeWorkload': {
-          const { workload } = (msg.params || {}) as { workload?: WorkloadDescriptor };
+          const { workload, forceSwarm } = (msg.params || {}) as { workload?: WorkloadDescriptor; forceSwarm?: boolean };
           if (!workload || !workload.computation || !workload.computation.kernelId) {
             throw new Error('Invalid Workload IR: computation.kernelId is required');
           }
@@ -305,7 +306,20 @@ export class IpcServer {
           }));
 
           const decision = this.decisionEngine.evaluate(workload, connectedWorkers);
-          if (decision.decision !== 'SWARM') {
+
+          if (forceSwarm) {
+            const eligibleWorkers = this.workerManager.listWorkers().filter(w => w.isEligible);
+            if (eligibleWorkers.length === 0) {
+              return {
+                id: msg.id,
+                result: {
+                  status: 'FAILED',
+                  reason: 'No eligible remote worker available in cluster for forced swarm execution'
+                }
+              };
+            }
+            Logger.execution(`Demo forced distributed execution across ${eligibleWorkers.length} remote worker(s)`);
+          } else if (decision.decision !== 'SWARM') {
             return {
               id: msg.id,
               result: {
@@ -321,7 +335,10 @@ export class IpcServer {
           const task = this.taskStore.createTask({
             id: taskId,
             inputRef: workload.data.locator?.uri || 'inline_payload',
-            computationDescriptor: workload.computation.kernelId,
+            computationDescriptor: JSON.stringify({
+              kernelId: workload.computation.kernelId,
+              parameters: workload.computation.parameters || {}
+            }),
             requiredResources: { minCpuCores: 1, minRamMb: 64 },
             dependencies: [],
             executionConstraints: (workload.computation.parameters as any) || {},
@@ -338,13 +355,14 @@ export class IpcServer {
             return {
               id: msg.id,
               result: {
-                status: 'LOCAL_FALLBACK',
+                status: forceSwarm ? 'FAILED' : 'LOCAL_FALLBACK',
                 reason: `Scheduler could not place task (${scheduleResult.status})`
               }
             };
           }
 
           const workerId = scheduleResult.selectedWorker.deviceId;
+          Logger.execution(`Selected remote worker: ${workerId} (${scheduleResult.selectedWorker.capabilityProfile?.deviceName || 'Worker'})`);
           this.taskStore.assignTask(task.id, workerId, 30000);
 
           // 4. Await completion from WorkloadPipeline with timeout
@@ -371,6 +389,8 @@ export class IpcServer {
           });
 
           // 5. Dispatch via TransportServer
+          Logger.execution(`Dispatching task: ${task.id}`);
+          Logger.execution(`Remote execution started: ${workerId}`);
           const sent = this.transportServer.sendExecuteTask(
             workerId,
             task,
@@ -382,12 +402,17 @@ export class IpcServer {
             this.taskStore.recordTaskFailure(task.id, workerId, 'TRANSPORT_SEND_FAILED', {});
             return {
               id: msg.id,
-              result: { status: 'LOCAL_FALLBACK', reason: 'Failed to dispatch to worker transport' }
+              result: {
+                status: forceSwarm ? 'FAILED' : 'LOCAL_FALLBACK',
+                reason: 'Failed to dispatch to worker transport'
+              }
             };
           }
 
           const executionResult = await completionPromise;
           if (executionResult.status === 'COMPLETED') {
+            Logger.execution(`Remote execution completed: ${workerId}`);
+            Logger.validation(`Remote result passed pixel validation for task ${task.id}`);
             return {
               id: msg.id,
               result: {
@@ -401,7 +426,7 @@ export class IpcServer {
             return {
               id: msg.id,
               result: {
-                status: 'LOCAL_FALLBACK',
+                status: forceSwarm ? 'FAILED' : 'LOCAL_FALLBACK',
                 reason: executionResult.error || 'Worker execution failed',
                 details: executionResult
               }

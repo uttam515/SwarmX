@@ -349,6 +349,7 @@ export class TransportServer {
       case 'TASK_RESULT': {
         const decryptedBytes = this.pairingService.decryptEnvelope(msg.envelope);
         const resultPayload = JSON.parse(decryptedBytes.toString('utf-8'));
+        Logger.execution(`Result received: ${resultPayload.taskId || msg.taskId}`);
         
         let processingResult = null;
         if (this.workloadPipeline) {

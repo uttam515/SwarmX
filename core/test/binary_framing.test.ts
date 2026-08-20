@@ -95,4 +95,31 @@ describe('Binary Data Path & Zero-Copy Framing Security (Sprint 2.4A)', () => {
     expect(decoded).to.not.be.null;
     expect(decoded!.payload.length).to.equal(2048);
   });
+
+  it('8. Handles executeWorkload nested params.workload.data.totalPayloadBytes with fragmented arrival', () => {
+    const metadata = {
+      id: 1,
+      method: 'executeWorkload',
+      params: {
+        workload: {
+          workloadId: 'wkl-test-fragment',
+          computation: { kernelId: 'image_filter_box_blur_v1' },
+          data: { totalPayloadBytes: 65536 }
+        },
+        forceSwarm: true
+      }
+    };
+    const rawPayload = Buffer.alloc(65536, 140);
+    const frame = encodeBinaryFrame(metadata, rawPayload);
+
+    // Fragment: only header + 16KB of payload arrives in first packet
+    const partialFrame = frame.subarray(0, 16384);
+    expect(decodeBinaryFrame(partialFrame)).to.be.null; // Must wait for the full 65KB payload!
+
+    // Full frame arrives
+    const decoded = decodeBinaryFrame(frame);
+    expect(decoded).to.not.be.null;
+    expect(decoded!.payload.length).to.equal(65536);
+    expect(decoded!.metadata.params.workload.workloadId).to.equal('wkl-test-fragment');
+  });
 });

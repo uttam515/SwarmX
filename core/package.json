@@ -6,6 +6,7 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc",
+    "compile": "tsc --noEmit",
     "start": "ts-node src/index.ts",
     "test": "mocha --require ts-node/register --timeout 10000 'test/**/*.test.ts'"
   },
