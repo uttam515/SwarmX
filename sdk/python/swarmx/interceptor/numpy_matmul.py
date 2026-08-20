@@ -6,6 +6,7 @@ and transparently offloads to SwarmX Core with zero application code modificatio
 
 import os
 import sys
+import uuid
 from typing import Any, Tuple
 
 _ORIGINAL_NUMPY_MATMUL = None
@@ -96,7 +97,7 @@ def swarmx_matmul(a: Any, b: Any, *args, **kwargs) -> Any:
 
         # 3. Construct platform-neutral Workload IR
         workload_ir = {
-            "workloadId": f"wkl-matmul-{id(a)}-{id(b)}-{M}x{N}",
+            "workloadId": f"wkl-matmul-{uuid.uuid4().hex[:8]}-{M}x{N}",
             "version": "1.0.0",
             "computation": {
                 "domain": "NUMERICAL_COMPUTATION",

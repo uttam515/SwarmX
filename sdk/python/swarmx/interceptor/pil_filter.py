@@ -1,5 +1,6 @@
 import base64
 import os
+import uuid
 from typing import Optional
 from PIL import Image, ImageFilter
 from swarmx.client import SwarmClient
@@ -59,7 +60,7 @@ def swarmx_image_filter(self: Image.Image, filter_spec) -> Image.Image:
 
         # 4. Construct platform-neutral Workload IR (metadata only for evaluation)
         workload_ir = {
-            "workloadId": f"wkl-boxblur-{id(self)}-{radius}",
+            "workloadId": f"wkl-boxblur-{uuid.uuid4().hex[:8]}-{radius}",
             "version": "1.0.0",
             "computation": {
                 "domain": "IMAGE_PROCESSING",

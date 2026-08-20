@@ -1,6 +1,7 @@
 import * as net from 'net';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as crypto from 'crypto';
 import { TaskStore } from './db/task_store';
 import { WorkerManager } from './worker_manager';
 import { PairingService } from './pairing_service';
@@ -331,7 +332,10 @@ export class IpcServer {
           }
 
           // 2. Create Task in TaskStore
-          const taskId = workload.workloadId || `wkl-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+          let taskId = workload.workloadId || `wkl-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+          if (this.taskStore.getTask(taskId)) {
+            taskId = `${taskId}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+          }
           const task = this.taskStore.createTask({
             id: taskId,
             inputRef: workload.data.locator?.uri || 'inline_payload',
