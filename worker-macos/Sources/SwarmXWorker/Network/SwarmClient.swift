@@ -99,7 +99,20 @@ public class SwarmClient {
             self.hostUrl = hostUrl
         }
         print("🔗 Connecting to SwarmX Host at \(self.hostUrl)...")
-        let endpoint = NWEndpoint.url(self.hostUrl)
+        let endpoint: NWEndpoint
+        if let host = self.hostUrl.host, let port = self.hostUrl.port {
+            endpoint = NWEndpoint.hostPort(
+                host: NWEndpoint.Host(host),
+                port: NWEndpoint.Port(integerLiteral: UInt16(port))
+            )
+        } else if let host = self.hostUrl.host {
+            endpoint = NWEndpoint.hostPort(
+                host: NWEndpoint.Host(host),
+                port: NWEndpoint.Port(integerLiteral: 50051)
+            )
+        } else {
+            endpoint = NWEndpoint.url(self.hostUrl)
+        }
         self.initiateConnection(to: endpoint)
     }
 
@@ -108,11 +121,6 @@ public class SwarmClient {
         wsOptions.autoReplyPing = true
 
         let parameters = NWParameters.tcp
-        parameters.includePeerToPeer = true
-        parameters.prohibitExpensivePaths = false
-        parameters.prohibitConstrainedPaths = false
-        parameters.allowLocalEndpointReuse = true
-        parameters.serviceClass = .responsiveData
         parameters.defaultProtocolStack.applicationProtocols.insert(wsOptions, at: 0)
 
         let conn = NWConnection(to: endpoint, using: parameters)
