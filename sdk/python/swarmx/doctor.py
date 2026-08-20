@@ -90,8 +90,8 @@ def run_diagnostics(ipc_socket_path: str = "/tmp/swarmx.sock", target_host: str 
     print(f"  • TCP Reachable:    {'YES' if tcp_reachable else 'NO (Core daemon may not be started)'}")
     print(f"  • WebSocket State:  {report['transport']['webSocketStatus']}")
 
-    # 4. SWARM PROTOCOL & IPC LAYER
-    print("\n[4/6] ⚙️ SWARM PROTOCOL & IPC LAYER")
+    # 4. SWARM PROTOCOL & WORKERS
+    print("\n[4/6] ⚙️ SWARM PROTOCOL & WORKERS")
     ipc_ready = False
     core_status: Dict[str, Any] = {}
     if os.path.exists(ipc_socket_path):
@@ -111,7 +111,7 @@ def run_diagnostics(ipc_socket_path: str = "/tmp/swarmx.sock", target_host: str 
             if "result" in resp:
                 core_status = resp["result"]
                 ipc_ready = True
-        except Exception as e:
+        except Exception:
             ipc_ready = False
 
     ws_conns = core_status.get('webSocketConnectionCount', 0) if ipc_ready else 0
@@ -130,15 +130,15 @@ def run_diagnostics(ipc_socket_path: str = "/tmp/swarmx.sock", target_host: str 
         "eligibleWorkers": eligible_workers,
         "coreStatus": core_status
     }
-    print(f"  • IPC Socket Path:  {ipc_socket_path}")
-    print(f"  • Core IPC State:   {'ONLINE' if ipc_ready else 'OFFLINE (Run: cd core && npm start)'}")
+    print(f"  • IPC Socket Path:    {ipc_socket_path}")
+    print(f"  • Core IPC State:     {'ONLINE' if ipc_ready else 'OFFLINE (Run: cd core && npm start)'}")
     if ipc_ready:
-        print(f"  • WebSocket Clients:{ws_conns}")
-        print(f"  • Discovered Nodes: {disc_workers}")
-        print(f"  • Registered Workers:{reg_workers}")
-        print(f"  • Paired (Trusted): {paired_workers}")
-        print(f"  • Ready (Eligible): {eligible_workers}")
-        print(f"  • Certified Kernels:{core_status.get('certifiedKernels', ['image_filter_box_blur_v1'])}")
+        print(f"  • WebSocket Clients:  {ws_conns}")
+        print(f"  • Discovered Nodes:   {disc_workers}")
+        print(f"  • Registered Workers: {reg_workers}")
+        print(f"  • Paired Workers:     {paired_workers}")
+        print(f"  • Ready Workers:      {eligible_workers}")
+        print(f"  • Certified Kernels:  {core_status.get('certifiedKernels', ['image_filter_box_blur_v1'])}")
 
     # 5. PAIRING & SECURITY LAYER
     print("\n[5/6] 🔒 PAIRING & SECURITY LAYER")

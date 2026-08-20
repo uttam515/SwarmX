@@ -32,8 +32,7 @@ case "$COMMAND" in
     ;;
 
   demo)
-    echo "🚀 Running Flagship Demo (Unmodified Python Application)..."
-    SWARMX_DEBUG=1 python3 "$SWARMX_ROOT/examples/flagship_demo.py"
+    python3 "$SWARMX_ROOT/examples/flagship_demo.py"
     ;;
 
   status)
