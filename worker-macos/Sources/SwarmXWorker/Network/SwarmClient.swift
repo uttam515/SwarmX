@@ -321,7 +321,9 @@ public class SwarmClient {
                let decryptedData = try? PairingManager.shared.decryptEnvelope(envelope: envelope),
                let taskPayload = try? JSONDecoder().decode(TaskPayload.self, from: decryptedData) {
                 
-                print("⚙️ Executing Task [\(taskPayload.taskId)] (Kernel: \(taskPayload.computationDescriptor))...")
+                let workerHost = Host.current().localizedName ?? ProcessInfo.processInfo.hostName
+                let workerPid = ProcessInfo.processInfo.processIdentifier
+                print("⚙️ [SwarmX Worker] Received Task [\(taskPayload.taskId)] on \(workerHost) (PID: \(workerPid))...")
                 DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                     guard let self = self else { return }
                     let resultPayload = ImageProcessingKernel.shared.processTask(payload: taskPayload)
@@ -345,7 +347,7 @@ public class SwarmClient {
                             "envelope": envDict
                         ]
                         self.send(json: msg)
-                        print("✅ Completed & Sent Result for Task [\(taskPayload.taskId)] (\(resultPayload.executionTimeMs)ms)")
+                        print("✅ [SwarmX Worker] Completed Task [\(taskPayload.taskId)] on \(workerHost) (PID: \(workerPid)) in \(resultPayload.executionTimeMs)ms")
                     }
                 }
             }

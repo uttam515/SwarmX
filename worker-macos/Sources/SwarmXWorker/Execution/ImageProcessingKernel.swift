@@ -16,6 +16,8 @@ public struct TaskResultPayload: Codable {
     public let outputData: String
     public let executionTimeMs: Int64
     public let itemCount: Int?
+    public let workerHostname: String?
+    public let workerPid: Int32?
 }
 
 public struct KernelParameters: Codable {
@@ -170,13 +172,18 @@ public class ImageProcessingKernel {
         let elapsedNs = endTime.uptimeNanoseconds - startTime.uptimeNanoseconds
         let elapsedMs = max(1, Int64(elapsedNs / 1_000_000))
 
+        let hostName = Host.current().localizedName ?? ProcessInfo.processInfo.hostName
+        let pid = ProcessInfo.processInfo.processIdentifier
+
         return TaskResultPayload(
             taskId: payload.taskId,
             attemptNumber: payload.attemptNumber,
             status: "COMPLETED",
             outputData: outputDataString,
             executionTimeMs: elapsedMs,
-            itemCount: itemCount
+            itemCount: itemCount,
+            workerHostname: hostName,
+            workerPid: pid
         )
     }
 

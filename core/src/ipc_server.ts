@@ -13,6 +13,7 @@ import { KernelRegistry } from './kernel_registry';
 import { BINARY_FRAME_MAGIC, encodeBinaryFrame, decodeBinaryFrame } from './binary_framing';
 import { Task, TaskStatus, WorkloadDescriptor } from './types';
 import { Logger } from './logger';
+import { SimulationWorkerAdapter } from './simulation_worker';
 
 export interface IpcMessage {
   id: string | number;
@@ -26,6 +27,19 @@ export interface IpcResponse {
   error?: string;
 }
 
+export interface WorkloadExecutionEvent {
+  workloadId: string;
+  taskId: string;
+  workerId: string;
+  workerHostname: string;
+  workerPid?: number;
+  status: 'SUBMITTED' | 'RUNNING' | 'COMPLETE' | 'FAILED' | 'LOCAL_FALLBACK';
+  startTimeMs: number;
+  endTimeMs?: number;
+  durationSeconds?: number;
+  kernelId: string;
+}
+
 export class IpcServer {
   private server: net.Server | null = null;
   private socketPath: string;
@@ -37,6 +51,25 @@ export class IpcServer {
   private scheduler?: ScoredScheduler;
   private decisionEngine: DistributionDecisionEngine;
   private swarmEnabled: boolean = true;
+  private forceSwarmOverride: boolean = false;
+  private simulationWorker: SimulationWorkerAdapter = new SimulationWorkerAdapter();
+  private recentWorkloads: WorkloadExecutionEvent[] = [];
+
+  public recordWorkloadEvent(event: WorkloadExecutionEvent): void {
+    const existingIdx = this.recentWorkloads.findIndex(w => w.workloadId === event.workloadId || w.taskId === event.taskId);
+    if (existingIdx >= 0) {
+      this.recentWorkloads[existingIdx] = { ...this.recentWorkloads[existingIdx], ...event };
+    } else {
+      this.recentWorkloads.push(event);
+      if (this.recentWorkloads.length > 50) {
+        this.recentWorkloads.shift();
+      }
+    }
+  }
+
+  public getRecentWorkloads(): WorkloadExecutionEvent[] {
+    return [...this.recentWorkloads];
+  }
 
   private activeSockets: Set<net.Socket> = new Set();
 
@@ -181,6 +214,7 @@ export class IpcServer {
             id: msg.id,
             result: {
               enabled: this.swarmEnabled,
+              forceSwarmOverride: this.forceSwarmOverride,
               totalTasks: tasks.length,
               pendingTasks: tasks.filter(t => t.status === 'PENDING').length,
               runningTasks: tasks.filter(t => t.status === 'RUNNING').length,
@@ -241,6 +275,17 @@ export class IpcServer {
           return { id: msg.id, result: { enabled: this.swarmEnabled } };
         }
 
+        case 'setForceSwarmMode': {
+          const { enabled } = msg.params || {};
+          this.forceSwarmOverride = Boolean(enabled);
+          Logger.execution(`[CONFIG] Force Swarm mode set to: ${this.forceSwarmOverride}`);
+          return { id: msg.id, result: { success: true, forceSwarm: this.forceSwarmOverride } };
+        }
+
+        case 'getForceSwarmMode': {
+          return { id: msg.id, result: { forceSwarm: this.forceSwarmOverride } };
+        }
+
         case 'listTasks': {
           const tasks = this.taskStore.listTasks();
           return { id: msg.id, result: tasks };
@@ -283,6 +328,19 @@ export class IpcServer {
           }));
 
           const decision = this.decisionEngine.evaluate(workload, connectedWorkers);
+          if (this.forceSwarmOverride) {
+            const eligibleWorkers = this.workerManager.listWorkers().filter(w => w.isEligible);
+            if (eligibleWorkers.length > 0) {
+              return {
+                id: msg.id,
+                result: {
+                  ...decision,
+                  decision: 'SWARM',
+                  reason: 'Forced Swarm demo mode enabled (Core override)'
+                }
+              };
+            }
+          }
           return { id: msg.id, result: decision };
         }
 
@@ -307,8 +365,9 @@ export class IpcServer {
           }));
 
           const decision = this.decisionEngine.evaluate(workload, connectedWorkers);
+          const isForceSwarm = Boolean(forceSwarm || this.forceSwarmOverride);
 
-          if (forceSwarm) {
+          if (isForceSwarm) {
             const eligibleWorkers = this.workerManager.listWorkers().filter(w => w.isEligible);
             if (eligibleWorkers.length === 0) {
               return {
@@ -359,7 +418,7 @@ export class IpcServer {
             return {
               id: msg.id,
               result: {
-                status: forceSwarm ? 'FAILED' : 'LOCAL_FALLBACK',
+                status: isForceSwarm ? 'FAILED' : 'LOCAL_FALLBACK',
                 reason: `Scheduler could not place task (${scheduleResult.status})`
               }
             };
@@ -392,50 +451,145 @@ export class IpcServer {
             }
           });
 
-          // 5. Dispatch via TransportServer
+          // 5. Dispatch via SimulationWorkerAdapter or TransportServer
           Logger.execution(`Dispatching task: ${task.id}`);
-          Logger.execution(`Remote execution started: ${workerId}`);
-          const sent = this.transportServer.sendExecuteTask(
-            workerId,
-            task,
-            workload.data.payloadBase64,
-            workload.data.itemCount
-          );
+          if (workerId === SimulationWorkerAdapter.DEVICE_ID) {
+            Logger.execution(`Simulation execution started: ${workerId}`);
+            this.simulationWorker.executeTask(task, workload.data.payloadBase64, workload.data.itemCount)
+              .then(async (simResult) => {
+                if (this.workloadPipeline) {
+                  await this.workloadPipeline.handleTaskResult(simResult);
+                }
+              })
+              .catch((err) => {
+                this.taskStore.recordTaskFailure(task.id, workerId, 'SIMULATION_EXECUTION_FAILED', { error: err.message });
+              });
+          } else {
+            Logger.execution(`Remote execution started: ${workerId}`);
+            const sent = this.transportServer.sendExecuteTask(
+              workerId,
+              task,
+              workload.data.payloadBase64,
+              workload.data.itemCount
+            );
 
-          if (!sent) {
-            this.taskStore.recordTaskFailure(task.id, workerId, 'TRANSPORT_SEND_FAILED', {});
-            return {
-              id: msg.id,
-              result: {
-                status: forceSwarm ? 'FAILED' : 'LOCAL_FALLBACK',
-                reason: 'Failed to dispatch to worker transport'
-              }
-            };
+            if (!sent) {
+              this.taskStore.recordTaskFailure(task.id, workerId, 'TRANSPORT_SEND_FAILED', {});
+              return {
+                id: msg.id,
+                result: {
+                  status: isForceSwarm ? 'FAILED' : 'LOCAL_FALLBACK',
+                  reason: 'Failed to dispatch to worker transport'
+                }
+              };
+            }
           }
 
+          // Record initial submission in recentWorkloads
+          const wklId = workload.workloadId || task.id;
+          const hostName = scheduleResult.selectedWorker.capabilityProfile?.deviceName || workerId;
+          this.recordWorkloadEvent({
+            workloadId: wklId,
+            taskId: task.id,
+            workerId,
+            workerHostname: hostName,
+            status: 'RUNNING',
+            startTimeMs: task.createdAtMs,
+            kernelId: workload.computation.kernelId
+          });
+
           const executionResult = await completionPromise;
+          const finalHost = executionResult.workerHostname || hostName;
+          const finalPid = executionResult.workerPid;
+          const pidStr = finalPid ? ` (PID: ${finalPid})` : '';
+
           if (executionResult.status === 'COMPLETED') {
-            Logger.execution(`Remote execution completed: ${workerId}`);
+            Logger.execution(`Remote execution completed on ${finalHost}${pidStr} for workload ${wklId}`);
             Logger.validation(`Remote result passed pixel validation for task ${task.id}`);
+
+            this.recordWorkloadEvent({
+              workloadId: wklId,
+              taskId: task.id,
+              workerId,
+              workerHostname: finalHost,
+              workerPid: finalPid,
+              status: 'COMPLETE',
+              startTimeMs: task.createdAtMs,
+              endTimeMs: Date.now(),
+              durationSeconds: ((Date.now() - task.createdAtMs) / 1000),
+              kernelId: workload.computation.kernelId
+            });
+
             return {
               id: msg.id,
               result: {
                 status: 'COMPLETED',
                 taskId: task.id,
+                workloadId: wklId,
                 outputData: executionResult.outputData,
-                workerId
+                workerId,
+                workerHostname: finalHost,
+                workerPid: finalPid,
+                executionTimeMs: executionResult.executionTimeMs || (Date.now() - task.createdAtMs)
               }
             };
           } else {
+            this.recordWorkloadEvent({
+              workloadId: wklId,
+              taskId: task.id,
+              workerId,
+              workerHostname: finalHost,
+              workerPid: finalPid,
+              status: 'FAILED',
+              startTimeMs: task.createdAtMs,
+              endTimeMs: Date.now(),
+              durationSeconds: ((Date.now() - task.createdAtMs) / 1000),
+              kernelId: workload.computation.kernelId
+            });
+
             return {
               id: msg.id,
               result: {
-                status: forceSwarm ? 'FAILED' : 'LOCAL_FALLBACK',
+                status: isForceSwarm ? 'FAILED' : 'LOCAL_FALLBACK',
                 reason: executionResult.error || 'Worker execution failed',
                 details: executionResult
               }
             };
           }
+        }
+
+        case 'listRecentWorkloads': {
+          return { id: msg.id, result: this.getRecentWorkloads() };
+        }
+
+        case 'setSimulationMode': {
+          const { enabled, failureMode, simulatedDelayMs } = msg.params || {};
+          const cfg = this.simulationWorker.setConfig({
+            enabled: Boolean(enabled),
+            failureMode: failureMode || 'NONE',
+            simulatedDelayMs: simulatedDelayMs !== undefined ? simulatedDelayMs : 25
+          });
+
+          if (cfg.enabled) {
+            this.workerManager.registerWorker(this.simulationWorker.getCapabilityProfile());
+            this.workerManager.updateTelemetry(this.simulationWorker.getTelemetry());
+            Logger.workerState(`🧪 SIMULATION WORKER ENABLED: ${SimulationWorkerAdapter.DEVICE_ID}`);
+          } else {
+            this.workerManager.unregisterWorker(SimulationWorkerAdapter.DEVICE_ID);
+            Logger.workerState(`🧪 SIMULATION WORKER DISABLED`);
+          }
+
+          return { id: msg.id, result: { success: true, config: cfg } };
+        }
+
+        case 'getSimulationStatus': {
+          return {
+            id: msg.id,
+            result: {
+              config: this.simulationWorker.getConfig(),
+              profile: this.simulationWorker.getCapabilityProfile()
+            }
+          };
         }
 
         case 'getWorkloadProgress': {

@@ -10,6 +10,8 @@ export interface TaskResultPayload {
   executionTimeMs: number;
   attemptNumber?: number; // 1-indexed generation/attempt counter
   itemCount?: number;
+  workerHostname?: string;
+  workerPid?: number;
 }
 
 export interface TaskProcessingResult {
@@ -18,6 +20,9 @@ export interface TaskProcessingResult {
   task: Task;
   error?: string;
   validationDetails?: any;
+  workerHostname?: string;
+  workerPid?: number;
+  executionTimeMs?: number;
 }
 
 export interface WorkloadProgress {
@@ -212,7 +217,10 @@ export class WorkloadPipeline {
         success: true,
         status: TaskStatus.COMPLETED,
         task: completedTask,
-        validationDetails: validation.details
+        validationDetails: validation.details,
+        workerHostname: payload.workerHostname,
+        workerPid: payload.workerPid,
+        executionTimeMs: payload.executionTimeMs
       };
     } else {
       // 2. Tolerance Validation Failure: Record failure with worker exclusion

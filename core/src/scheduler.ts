@@ -166,9 +166,15 @@ export class ScoredScheduler implements IScheduler {
 
       // Kernel compatibility check
       if (worker.capabilityProfile.supportedKernels && worker.capabilityProfile.supportedKernels.length > 0) {
-        if (!worker.capabilityProfile.supportedKernels.includes(task.computationDescriptor)) {
+        let kernelId = task.computationDescriptor;
+        try {
+          const parsed = JSON.parse(task.computationDescriptor);
+          if (parsed.kernelId) kernelId = parsed.kernelId;
+        } catch (e) {}
+
+        if (!worker.capabilityProfile.supportedKernels.includes(kernelId) && !worker.capabilityProfile.supportedKernels.includes(task.computationDescriptor)) {
           isEligible = false;
-          rejectionReason = `Kernel '${task.computationDescriptor}' not in worker supportedKernels`;
+          rejectionReason = `Kernel '${kernelId}' not in worker supportedKernels`;
         }
       }
 

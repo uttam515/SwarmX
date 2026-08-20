@@ -15,6 +15,26 @@
   ],
   "main": "./dist/extension.js",
   "contributes": {
+    "configuration": {
+      "title": "SwarmX Distributed Runtime",
+      "properties": {
+        "swarmx.enableWorkspaceIntegration": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable transparent PYTHONPATH environment injection for automatic zero-import execution in this workspace."
+        },
+        "swarmx.forceSwarmDemoMode": {
+          "type": "boolean",
+          "default": false,
+          "description": "DEMO MODE ONLY: Forces distributed execution to an eligible remote worker regardless of cost model speedup."
+        },
+        "swarmx.enableSimulationMode": {
+          "type": "boolean",
+          "default": false,
+          "description": "DEVELOPMENT SIMULATION ONLY: Enables an isolated virtual Apple Silicon worker for testing without physical Mac #2."
+        }
+      }
+    },
     "viewsContainers": {
       "activitybar": [
         {
@@ -26,6 +46,11 @@
     },
     "views": {
       "swarmx-sidebar": [
+        {
+          "type": "webview",
+          "id": "swarmx.dashboardView",
+          "name": "SwarmX Control Center"
+        },
         {
           "id": "swarmx.workersView",
           "name": "Connected Swarm Workers"
@@ -42,6 +67,40 @@
     },
     "commands": [
       {
+        "command": "swarmx.refresh",
+        "title": "SwarmX: Refresh Cluster State",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "swarmx.enableWorkspace",
+        "title": "SwarmX: Enable Workspace Integration"
+      },
+      {
+        "command": "swarmx.disableWorkspace",
+        "title": "SwarmX: Disable Workspace Integration"
+      },
+      {
+        "command": "swarmx.toggleForceSwarmDemo",
+        "title": "SwarmX: Toggle Force Swarm (Demo Mode)"
+      },
+      {
+        "command": "swarmx.toggleSimulation",
+        "title": "SwarmX: Toggle Development Simulation Mode"
+      },
+      {
+        "command": "swarmx.enableSimulation",
+        "title": "SwarmX: Enable Development Simulation Mode"
+      },
+      {
+        "command": "swarmx.disableSimulation",
+        "title": "SwarmX: Disable Development Simulation Mode"
+      },
+      {
+        "command": "swarmx.viewLogs",
+        "title": "SwarmX: View Host Daemon Logs",
+        "icon": "$(output)"
+      },
+      {
         "command": "swarmx.connectWorker",
         "title": "Connect / Pair Worker",
         "icon": "$(plug)"
@@ -55,18 +114,18 @@
         "command": "swarmx.toggleSwarm",
         "title": "Toggle Swarm Distributed Execution",
         "icon": "$(pulse)"
-      },
-      {
-        "command": "swarmx.refresh",
-        "title": "Refresh Swarm State",
-        "icon": "$(refresh)"
       }
     ],
     "menus": {
       "view/title": [
         {
           "command": "swarmx.refresh",
-          "when": "view == swarmx.workersView",
+          "when": "view == swarmx.dashboardView || view == swarmx.workersView",
+          "group": "navigation"
+        },
+        {
+          "command": "swarmx.viewLogs",
+          "when": "view == swarmx.dashboardView",
           "group": "navigation"
         },
         {
@@ -92,11 +151,17 @@
   "scripts": {
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./"
+    "watch": "tsc -watch -p ./",
+    "test": "mocha --require ts-node/register --timeout 10000 'test/**/*.test.ts'"
   },
   "devDependencies": {
+    "@types/chai": "^4.3.20",
+    "@types/mocha": "^10.0.10",
     "@types/node": "^20.17.19",
     "@types/vscode": "^1.80.0",
+    "chai": "^4.5.0",
+    "mocha": "^10.8.2",
+    "ts-node": "^10.9.2",
     "typescript": "^5.7.3"
   }
 }

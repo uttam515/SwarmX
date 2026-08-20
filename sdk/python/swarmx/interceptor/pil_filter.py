@@ -1,5 +1,6 @@
 import base64
 import os
+import threading
 import uuid
 from typing import Optional
 from PIL import Image, ImageFilter
@@ -9,6 +10,16 @@ from swarmx.client import SwarmClient
 _ORIGINAL_PIL_FILTER = Image.Image.filter
 _INTERCEPTOR_INSTALLED = False
 _GLOBAL_CLIENT: Optional[SwarmClient] = None
+_WORKLOAD_COUNTER = 0
+_COUNTER_LOCK = threading.Lock()
+
+def _next_workload_id(kernel_name: str = "boxblur") -> str:
+    global _WORKLOAD_COUNTER
+    with _COUNTER_LOCK:
+        _WORKLOAD_COUNTER += 1
+        count = _WORKLOAD_COUNTER
+    prefix = os.environ.get("SWARMX_WORKLOAD_PREFIX", "wkl")
+    return f"{prefix}-{kernel_name}-demo-{count:03d}"
 
 def get_swarm_client(socket_path: str = "/tmp/swarmx.sock") -> SwarmClient:
     global _GLOBAL_CLIENT
@@ -60,7 +71,7 @@ def swarmx_image_filter(self: Image.Image, filter_spec) -> Image.Image:
 
         # 4. Construct platform-neutral Workload IR (metadata only for evaluation)
         workload_ir = {
-            "workloadId": f"wkl-boxblur-{uuid.uuid4().hex[:8]}-{radius}",
+            "workloadId": _next_workload_id("boxblur"),
             "version": "1.0.0",
             "computation": {
                 "domain": "IMAGE_PROCESSING",

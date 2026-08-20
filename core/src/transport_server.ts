@@ -349,7 +349,9 @@ export class TransportServer {
       case 'TASK_RESULT': {
         const decryptedBytes = this.pairingService.decryptEnvelope(msg.envelope);
         const resultPayload = JSON.parse(decryptedBytes.toString('utf-8'));
-        Logger.execution(`Result received: ${resultPayload.taskId || msg.taskId}`);
+        const workerHost = resultPayload.workerHostname || msg.workerDeviceId;
+        const workerPidStr = resultPayload.workerPid ? ` (PID=${resultPayload.workerPid})` : '';
+        Logger.execution(`Result received for task ${resultPayload.taskId || msg.taskId} from ${workerHost}${workerPidStr} in ${resultPayload.executionTimeMs || 0}ms`);
         
         let processingResult = null;
         if (this.workloadPipeline) {
@@ -359,7 +361,9 @@ export class TransportServer {
             outputData: resultPayload.outputData,
             executionTimeMs: resultPayload.executionTimeMs || 0,
             attemptNumber: resultPayload.attemptNumber,
-            itemCount: resultPayload.itemCount
+            itemCount: resultPayload.itemCount,
+            workerHostname: resultPayload.workerHostname,
+            workerPid: resultPayload.workerPid
           });
         }
 

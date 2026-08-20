@@ -140,4 +140,51 @@ describe('IPC Workload Integration Tests (Phase C)', () => {
     expect(res.result.decision).to.equal('LOCAL');
     expect(res.result.reason).to.include('disabled by user');
   });
+
+  it('6. setForceSwarmMode enables Core-managed override and causes evaluateWorkload to return SWARM', async () => {
+    // 1. Enable simulation worker so an eligible worker exists
+    await sendIpc('setSimulationMode', { enabled: true });
+
+    // 2. Set Core-managed force swarm
+    const forceRes = await sendIpc('setForceSwarmMode', { enabled: true });
+    expect(forceRes.result.success).to.be.true;
+    expect(forceRes.result.forceSwarm).to.be.true;
+
+    // 3. evaluateWorkload now evaluates to SWARM
+    const evalRes = await sendIpc('evaluateWorkload', { workload: sampleBoxBlurWorkload });
+    expect(evalRes.result.decision).to.equal('SWARM');
+    expect(evalRes.result.reason).to.include('Core override');
+
+    // 4. Disable force swarm mode and verify it returns to adaptive decision
+    await sendIpc('setForceSwarmMode', { enabled: false });
+    const evalAdaptive = await sendIpc('evaluateWorkload', { workload: sampleBoxBlurWorkload });
+    expect(evalAdaptive.result.reason).to.not.include('Core override');
+  });
+
+  it('7. executeWorkload dispatches to virtual worker when Simulation Mode + Force Swarm are enabled', async () => {
+    await sendIpc('setSimulationMode', { enabled: true });
+    await sendIpc('setForceSwarmMode', { enabled: true });
+
+    const rawBuffer = Buffer.alloc(16 * 16 * 4, 120);
+    const wkl: WorkloadDescriptor = {
+      ...sampleBoxBlurWorkload,
+      computation: {
+        domain: 'IMAGE_PROCESSING',
+        kernelId: 'image_filter_box_blur_v1',
+        parameters: { radius: 2, width: 16, height: 16, mode: 'RGBA' }
+      },
+      data: {
+        itemCount: 1,
+        totalPayloadBytes: rawBuffer.length,
+        format: 'RAW_PLANAR_RGBA_UINT8',
+        payloadBase64: rawBuffer.toString('base64')
+      }
+    };
+
+    const execRes = await sendIpc('executeWorkload', { workload: wkl });
+    expect(execRes.error).to.be.undefined;
+    expect(execRes.result.status).to.equal('COMPLETED');
+    expect(execRes.result.workerId).to.equal('sim-worker-virtual-m3');
+    expect(execRes.result.workerHostname).to.include('Virtual');
+  });
 });
