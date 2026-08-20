@@ -101,15 +101,18 @@ export class TransportServer {
     // Advertise discovery via Bonjour / mDNS
     try {
       this.bonjour = new Bonjour();
+      const serviceName = `SwarmX Host (${process.env.USER || 'host'})`;
       this.bonjourService = this.bonjour.publish({
-        name: `SwarmX Host (${process.env.USER || 'host'})`,
+        name: serviceName,
         type: 'swarmx',
         port: this.port,
+        disableIPv6: true,
         txt: {
           v: '1',
           proto: 'grpc-ws'
         }
       });
+      Logger.transport(`Bonjour service published: '${serviceName}' (_swarmx._tcp.local) on port ${this.port} (IPv4)`);
     } catch (e) {
       console.warn('mDNS publish warning:', e);
     }
