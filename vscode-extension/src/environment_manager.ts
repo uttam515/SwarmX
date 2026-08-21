@@ -24,6 +24,20 @@ export class EnvironmentManager {
       const candidateSdk = path.join(root, 'sdk', 'python');
       if (fs.existsSync(candidateSdk)) {
         this.pythonSdkPath = candidateSdk;
+      } else {
+        // Search subdirectories for SwarmX project (e.g. opened in Demo/ containing swarmx/)
+        try {
+          const entries = fs.readdirSync(root, { withFileTypes: true });
+          for (const entry of entries) {
+            if (entry.isDirectory() && !entry.name.startsWith('.') && entry.name !== 'node_modules') {
+              const subSdk = path.join(root, entry.name, 'sdk', 'python');
+              if (fs.existsSync(subSdk)) {
+                this.pythonSdkPath = subSdk;
+                break;
+              }
+            }
+          }
+        } catch (e) {}
       }
     }
 

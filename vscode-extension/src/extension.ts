@@ -23,7 +23,7 @@ export async function activate(context: vscode.ExtensionContext) {
   // 1. Initialize IPC Client, Environment Manager, and Process Manager
   ipcClient = new CoreIpcClient('/tmp/swarmx.sock');
   envManager = new EnvironmentManager(context);
-  processManager = new ProcessManager(workspaceRoot, ipcClient);
+  processManager = new ProcessManager(workspaceRoot, ipcClient, context.extensionPath);
 
   // 2. Register Dashboard Webview Provider
   dashboardProvider = new DashboardViewProvider(context.extensionUri, ipcClient, envManager, processManager);

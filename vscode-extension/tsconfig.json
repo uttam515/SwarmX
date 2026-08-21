@@ -5,8 +5,8 @@
     "outDir": "dist",
     "lib": ["ES2022"],
     "sourceMap": true,
-    "rootDir": "src",
-    "strict": true
+    "strict": true,
+    "types": ["node", "mocha", "chai", "vscode"]
   },
-  "include": ["src"]
+  "include": ["src/**/*"]
 }

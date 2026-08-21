@@ -1,8 +1,10 @@
 import './mock_vscode';
+import 'mocha';
 import { expect } from 'chai';
 import * as net from 'net';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as os from 'os';
 import { CoreIpcClient } from '../src/core_ipc_client';
 import { ProcessManager } from '../src/process_manager';
 import { DashboardViewProvider } from '../src/views/dashboard_view_provider';
@@ -130,12 +132,15 @@ describe('VS Code Extension — Lifecycle & Dashboard Tests (Phase 4)', () => {
     if (ipcClient) {
       ipcClient.disconnect();
     }
-    server.close(() => {
-      if (fs.existsSync(testSocketPath)) {
+    if (server) {
+      server.close();
+    }
+    if (fs.existsSync(testSocketPath)) {
+      try {
         fs.unlinkSync(testSocketPath);
-      }
-      done();
-    });
+      } catch (e) {}
+    }
+    done();
   });
 
   it('1. CoreIpcClient connects to Unix socket and processes JSON-RPC requests', async () => {
@@ -176,6 +181,118 @@ describe('VS Code Extension — Lifecycle & Dashboard Tests (Phase 4)', () => {
 
     await procMgr.stopWorker();
     expect(procMgr.isWorkerOwned).to.be.false;
+  });
+
+  it('3b. ProcessManager: Constructs augmented PATH with NVM and Homebrew support', () => {
+    const procMgr = new ProcessManager('/tmp/test-ws', ipcClient);
+    const env = procMgr.getAugmentedEnv();
+    expect(env.PATH).to.be.a('string');
+    expect(env.PATH).to.include('/usr/bin');
+    expect(env.PATH).to.include('/bin');
+
+    // On macOS environments with Homebrew, Homebrew paths are included
+    if (fs.existsSync('/opt/homebrew/bin')) {
+      expect(env.PATH).to.include('/opt/homebrew/bin');
+    }
+  });
+
+  it('3c. ProcessManager: Resolves executable paths reliably from augmented environment', () => {
+    const procMgr = new ProcessManager('/tmp/test-ws', ipcClient);
+    const env = procMgr.getAugmentedEnv();
+
+    // Node or npm executable resolution
+    const nodeExe = procMgr.resolveExecutable('node', env);
+    expect(nodeExe).to.be.a('string');
+    expect(nodeExe.length).to.be.greaterThan(0);
+
+    const npmExe = procMgr.resolveExecutable('npm', env);
+    expect(npmExe).to.be.a('string');
+    expect(npmExe.length).to.be.greaterThan(0);
+
+    // Non-existent executable falls back to raw name
+    const fallbackExe = procMgr.resolveExecutable('nonexistent-binary-12345', env);
+    expect(fallbackExe).to.equal('nonexistent-binary-12345');
+  });
+
+  it('3d. ProcessManager: Duplicate Core and Worker spawn prevention', async () => {
+    const procMgr = new ProcessManager('/tmp/nonexistent-dir', ipcClient);
+
+    // Mock internal process to simulate active state
+    (procMgr as any).coreProcess = { kill: () => {} };
+    const coreStarted = await procMgr.startCore();
+    expect(coreStarted).to.be.true; // Handled idempotently
+
+    (procMgr as any).workerProcess = { kill: () => {} };
+    const workerStarted = await procMgr.startWorker();
+    expect(workerStarted).to.be.true; // Handled idempotently
+  });
+
+  it('3e. ProcessManager: Discovers SwarmX project root across direct, parent, and subfolder workspaces', () => {
+    // 1. Direct project root (contains core, worker-macos, sdk, vscode-extension)
+    const testProjectDir = path.join(__dirname, '..', '..');
+    const procMgrDirect = new ProcessManager(testProjectDir, ipcClient);
+    const directRoot = procMgrDirect.findProjectRoot();
+    expect(directRoot).to.not.be.null;
+    expect(fs.existsSync(path.join(directRoot!, 'core', 'package.json'))).to.be.true;
+
+    // 2. Opened inside subfolder: <project>/vscode-extension
+    const subfolderDir = path.join(testProjectDir, 'vscode-extension');
+    const procMgrSub = new ProcessManager(subfolderDir, ipcClient);
+    const subRoot = procMgrSub.findProjectRoot();
+    expect(subRoot).to.equal(path.resolve(testProjectDir));
+
+    // 3. Opened in parent directory containing project
+    const parentDir = path.dirname(testProjectDir);
+    const procMgrParent = new ProcessManager(parentDir, ipcClient);
+    const parentRoot = procMgrParent.findProjectRoot();
+    expect(parentRoot).to.not.be.null;
+    expect(fs.existsSync(path.join(parentRoot!, 'core', 'package.json'))).to.be.true;
+
+    // 4. Invalid workspace with no SwarmX structure
+    const invalidDir = path.join(os.tmpdir(), 'swarmx-test-invalid-dir-' + Date.now());
+    fs.mkdirSync(invalidDir, { recursive: true });
+    try {
+      const procMgrInvalid = new ProcessManager(invalidDir, ipcClient);
+      const invalidRoot = procMgrInvalid.findProjectRoot();
+      expect(invalidRoot).to.be.null;
+    } finally {
+      fs.rmdirSync(invalidDir);
+    }
+  });
+
+  it('3f. ProcessManager: Package identity verification for @swarmx/core', () => {
+    const testProjectDir = path.join(__dirname, '..', '..');
+    const procMgr = new ProcessManager(testProjectDir, ipcClient);
+
+    // Valid SwarmX Core
+    const coreDir = path.join(testProjectDir, 'core');
+    expect(procMgr.isSwarmXCoreDir(coreDir)).to.be.true;
+
+    // Invalid non-SwarmX directory with mock package.json
+    const fakeDir = path.join(os.tmpdir(), 'swarmx-test-fake-core-' + Date.now());
+    fs.mkdirSync(fakeDir, { recursive: true });
+    fs.writeFileSync(path.join(fakeDir, 'package.json'), JSON.stringify({ name: 'random-other-package' }));
+    try {
+      expect(procMgr.isSwarmXCoreDir(fakeDir)).to.be.false;
+    } finally {
+      fs.unlinkSync(path.join(fakeDir, 'package.json'));
+      fs.rmdirSync(fakeDir);
+    }
+  });
+
+  it('3g. ProcessManager: Discovers root using extensionPath when workspaceRoot is external', () => {
+    const testProjectDir = path.join(__dirname, '..', '..');
+    const extensionDir = path.join(testProjectDir, 'vscode-extension');
+    const dummyExternalDir = path.join(os.tmpdir(), 'dummy-external-workspace-' + Date.now());
+    fs.mkdirSync(dummyExternalDir, { recursive: true });
+
+    try {
+      const procMgr = new ProcessManager(dummyExternalDir, ipcClient, extensionDir);
+      const discoveredRoot = procMgr.findProjectRoot();
+      expect(discoveredRoot).to.equal(path.resolve(testProjectDir));
+    } finally {
+      fs.rmdirSync(dummyExternalDir);
+    }
   });
 
   it('4. DashboardViewProvider: Generates simplified 4-card UI with collapsible diagnostics', () => {
