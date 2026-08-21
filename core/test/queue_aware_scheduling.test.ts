@@ -1,3 +1,4 @@
+import 'mocha';
 import { expect } from 'chai';
 import { DistributionDecisionEngine, WorkerCandidateLoad } from '../src/decision_engine';
 import { WorkloadDescriptor } from '../src/types';

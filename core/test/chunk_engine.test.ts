@@ -1,3 +1,4 @@
+import 'mocha';
 import { expect } from 'chai';
 import { MatrixChunkEngine, MatrixChunkSpec, MatrixChunkResult } from '../src/chunk_engine';
 
