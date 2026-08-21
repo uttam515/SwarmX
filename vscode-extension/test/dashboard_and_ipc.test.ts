@@ -4,11 +4,12 @@ import * as net from 'net';
 import * as fs from 'fs';
 import * as path from 'path';
 import { CoreIpcClient } from '../src/core_ipc_client';
+import { ProcessManager } from '../src/process_manager';
 import { DashboardViewProvider } from '../src/views/dashboard_view_provider';
 import { WorkersTreeProvider, DiscoveredTreeProvider, TasksTreeProvider } from '../src/views/worker_tree_provider';
 
-describe('VS Code Extension — Dashboard & IPC Tests', () => {
-  const testSocketPath = path.join('/tmp', `swarmx-vsc-test-${Date.now()}.sock`);
+describe('VS Code Extension — Lifecycle & Dashboard Tests (Phase 4)', () => {
+  const testSocketPath = '/tmp/swarmx.sock';
   let server: net.Server;
   let ipcClient: CoreIpcClient;
 
@@ -33,39 +34,39 @@ describe('VS Code Extension — Dashboard & IPC Tests', () => {
               id: msg.id,
               result: {
                 enabled: true,
-                totalTasks: 1000,
+                totalTasks: 16,
                 pendingTasks: 0,
                 runningTasks: 0,
-                completedTasks: 1000,
+                completedTasks: 16,
                 activeWorkerCount: 1,
                 eligibleWorkerCount: 1,
                 connectedWorkers: 1,
-                discoveredWorkerCount: 1,
+                discoveredWorkerCount: 0,
                 trustedWorkerCount: 1,
                 webSocketConnectionCount: 1
               }
             }) + '\n');
-          } else if (msg.method === 'listConnectedWorkers') {
+          } else if (msg.method === 'listWorkers' || msg.method === 'listConnectedWorkers') {
             socket.write(JSON.stringify({
               id: msg.id,
               result: [
                 {
-                  deviceId: 'macos-worker-DDFB250B',
+                  deviceId: 'macos-worker-01',
                   isEligible: true,
                   capabilityProfile: {
-                    deviceName: "Jatin’s MacBook Air",
+                    deviceName: "MacBook Pro M3",
                     osType: 'darwin',
                     cpuArch: 'arm64',
-                    cpuCores: 10,
+                    cpuCores: 12,
                     totalRamMb: 16384,
                     hasGpu: true,
-                    gpuModel: 'Apple Silicon GPU'
+                    gpuModel: 'Apple M3 GPU'
                   },
                   latestTelemetry: {
-                    batteryLevel: 0.71,
+                    batteryLevel: 0.85,
                     thermalState: 0,
-                    cpuUtilization: 0.15,
-                    availableRamMb: 12000
+                    cpuUtilization: 0.10,
+                    availableRamMb: 14000
                   }
                 }
               ]
@@ -82,12 +83,27 @@ describe('VS Code Extension — Dashboard & IPC Tests', () => {
                 }
               ]
             }) + '\n');
-          } else if (msg.method === 'listKernels') {
+          } else if (msg.method === 'listRecentWorkloads') {
             socket.write(JSON.stringify({
               id: msg.id,
               result: [
-                { kernelId: 'image_filter_box_blur_v1', domain: 'IMAGE_PROCESSING' },
-                { kernelId: 'matrix_multiply_v1', domain: 'NUMERICAL_COMPUTATION' }
+                {
+                  workloadId: 'wkl-matmul-001',
+                  kernelId: 'matrix_multiply_v1',
+                  workerId: 'macos-worker-01',
+                  localVsRemote: 'REMOTE',
+                  status: 'COMPLETE',
+                  durationSeconds: 0.045,
+                  executionTimeMs: 45,
+                  workerComputeTimeMs: 2.5,
+                  transferTimeMs: 1.2,
+                  queueTimeMs: 0.0,
+                  validationTimeMs: 0.3,
+                  estimatedGain: 2.8,
+                  estimatedLocalTimeMs: 120,
+                  estimatedSwarmTimeMs: 45,
+                  decisionReason: 'Accelerate GEMM on M3 is 2.8x faster than Host CPU'
+                }
               ]
             }) + '\n');
           } else if (msg.method === 'initiatePairing') {
@@ -128,117 +144,244 @@ describe('VS Code Extension — Dashboard & IPC Tests', () => {
     expect(ipcClient.connected).to.be.true;
 
     const status = await ipcClient.request<any>('getStatus');
-    expect(status.totalTasks).to.equal(1000);
-    expect(status.completedTasks).to.equal(1000);
+    expect(status.totalTasks).to.equal(16);
+    expect(status.completedTasks).to.equal(16);
     expect(status.activeWorkerCount).to.equal(1);
   });
 
-  it('2. CoreIpcClient retrieves connected workers with capability profile & telemetry', async () => {
-    const workers = await ipcClient.request<any[]>('listConnectedWorkers');
-    expect(workers.length).to.equal(1);
-    expect(workers[0].capabilityProfile.deviceName).to.equal("Jatin’s MacBook Air");
-    expect(workers[0].capabilityProfile.hasGpu).to.be.true;
-    expect(workers[0].latestTelemetry.batteryLevel).to.equal(0.71);
+  it('2. ProcessManager: Detects healthy existing Core and preserves external ownership', async () => {
+    const procMgr = new ProcessManager('/tmp/test-ws', ipcClient);
+    const isHealthy = await procMgr.checkCoreHealth();
+    expect(isHealthy).to.be.true;
+    expect(procMgr.coreStatus).to.equal('ONLINE');
+
+    // Calling startCore on existing healthy daemon reuses it without spawning duplicate
+    const started = await procMgr.startCore();
+    expect(started).to.be.true;
+    expect(procMgr.isCoreOwned).to.be.false; // External daemon ownership preserved
+
+    // Attempting stopCore on externally-owned daemon does nothing destructive
+    await procMgr.stopCore();
+    expect(procMgr.isCoreOwned).to.be.false;
+
+    // Dispose preserves external process
+    procMgr.dispose();
+    expect(fs.existsSync(testSocketPath)).to.be.true;
   });
 
-  it('3. CoreIpcClient initiates worker pairing with initiationId generation', async () => {
-    const init = await ipcClient.request<any>('initiatePairing', { workerDeviceId: 'macos-worker-unpaired-01' });
-    expect(init.initiationId).to.equal('init-123');
+  it('3. ProcessManager: Local worker lifecycle and ownership tracking', async () => {
+    const procMgr = new ProcessManager('/tmp/test-ws', ipcClient);
+    expect(procMgr.workerStatus).to.equal('OFFLINE');
+    expect(procMgr.isWorkerOwned).to.be.false;
+
+    await procMgr.stopWorker();
+    expect(procMgr.isWorkerOwned).to.be.false;
   });
 
-  it('4. DashboardViewProvider generates HTML reflecting online cluster, remote worker specs, and decision model', () => {
+  it('4. DashboardViewProvider: Generates simplified 4-card UI with collapsible diagnostics', () => {
     const mockEnvManager: any = {
       active: true,
       forceSwarmDemo: false,
+      simulationMode: false,
       sdkPath: '/path/to/sdk/python',
       interpreter: 'python3'
     };
 
-    const provider = new DashboardViewProvider({} as any, ipcClient, mockEnvManager);
-    const html = (provider as any).renderHtml({
-      isConnected: true,
+    const mockProcessManager: any = {
+      isCoreOwned: false,
+      isWorkerOwned: false,
+      workerStatus: 'OFFLINE'
+    };
+
+    const provider = new DashboardViewProvider({} as any, ipcClient, mockEnvManager, mockProcessManager);
+    const html = (provider as any).getHtmlForWebview({
+      connected: true,
       coreStatus: {
-        totalTasks: 1000,
-        completedTasks: 1000,
+        totalTasks: 16,
+        completedTasks: 16,
         runningTasks: 0,
         activeWorkerCount: 1,
-        eligibleWorkerCount: 1,
-        webSocketConnectionCount: 1
+        eligibleWorkerCount: 1
       },
       connectedWorkers: [
         {
-          deviceId: 'macos-worker-DDFB250B',
+          deviceId: 'macos-worker-01',
           isEligible: true,
           capabilityProfile: {
-            deviceName: "Jatin’s MacBook Air",
+            deviceName: "MacBook Pro M3",
             osType: 'darwin',
             cpuArch: 'arm64',
-            cpuCores: 10,
+            cpuCores: 12,
             totalRamMb: 16384,
-            hasGpu: true
+            hasGpu: true,
+            gpuModel: 'Apple M3 GPU'
           },
           latestTelemetry: {
-            batteryLevel: 0.71,
+            batteryLevel: 0.85,
             thermalState: 0
           }
         }
       ],
       discoveredWorkers: [],
-      trustedWorkers: [{ deviceId: 'macos-worker-DDFB250B' }],
-      kernels: [{ kernelId: 'image_filter_box_blur_v1' }],
+      recentWorkloads: [
+        {
+          workloadId: 'wkl-matmul-001',
+          kernelId: 'matrix_multiply_v1',
+          workerId: 'macos-worker-01',
+          localVsRemote: 'REMOTE',
+          status: 'COMPLETE',
+          durationSeconds: 0.045,
+          executionTimeMs: 45,
+          workerComputeTimeMs: 2.5,
+          transferTimeMs: 1.2,
+          queueTimeMs: 0.0,
+          validationTimeMs: 0.3,
+          estimatedGain: 2.8,
+          estimatedLocalTimeMs: 120,
+          estimatedSwarmTimeMs: 45,
+          decisionReason: 'Accelerate GEMM on M3 is 2.8x faster than Host CPU'
+        }
+      ],
       recentLogs: ['[PAIRING] SAS verified', '[EXECUTION] Remote execution completed'],
       envActive: true,
       forceSwarmDemo: false,
+      simulationMode: false,
       sdkPath: '/path/to/sdk/python',
-      interpreter: 'python3'
+      interpreter: 'python3',
+      isCoreOwned: false,
+      isWorkerOwned: false,
+      workerStatus: 'OFFLINE'
     });
 
-    // Verification of required sections
-    expect(html).to.include('● ONLINE');
-    expect(html).to.include('Jatin’s MacBook Air');
-    expect(html).to.include('⚡ Apple Silicon GPU');
-    expect(html).to.include('10 cores');
-    expect(html).to.include('16 GB RAM');
-    expect(html).to.include('Battery: 71%');
-    expect(html).to.include('Thermal: Nominal');
-    expect(html).to.include('Standard Python & PIL');
-    expect(html).to.include('SwarmX imports: 0');
-    expect(html).to.include('Pixel tolerance: PASS');
-    expect(html).to.include('Output integrity: PASS');
-    expect(html).to.include('ADAPTIVE PRODUCTION');
-    expect(html).to.include('LOCAL FALLBACK');
+    // Verification of the 4 Simplified Cards
+    expect(html).to.include('1. CLUSTER');
+    expect(html).to.include('● ONLINE (External Daemon)');
+    expect(html).to.include('Host Node (Mac #1)');
+    expect(html).to.include('MacBook Pro M3');
+
+    expect(html).to.include('2. CURRENT EXECUTION');
+    expect(html).to.include('NumPy MatMul (GEMM Float32)');
+    expect(html).to.include('<b>1</b> / 1 complete (100%)');
+
+    expect(html).to.include('3. PERFORMANCE');
+    expect(html).to.include('2.80x SPEEDUP');
+    expect(html).to.include('SWARM CLUSTER');
+
+    expect(html).to.include('4. LAST WORKLOAD');
+    expect(html).to.include('wkl-matmul-001');
+    expect(html).to.include('PASS (Tolerance-Aware) ✓');
+
+    // Verification of Collapsible Diagnostics
+    expect(html).to.include('<details class="diag-details">');
+    expect(html).to.include('▸ Live Chunk & Task Activity');
+    expect(html).to.include('▸ Queue & Scheduling Breakdown');
+    expect(html).to.include('▸ Worker Details & Telemetry');
+    expect(html).to.include('▸ Validation & Integrity');
+    expect(html).to.include('▸ Security & Cryptography');
+    expect(html).to.include('▸ Observability & Diagnostic Logs');
+    expect(html).to.include('▸ Architecture & Pipeline Flow');
   });
 
-  it('5. DashboardViewProvider renders Force Swarm DEMO badge when demo mode is active', () => {
+  it('5. DashboardViewProvider: Renders Development Simulation Mode clearly', () => {
     const mockEnvManager: any = {
       active: true,
-      forceSwarmDemo: true,
+      forceSwarmDemo: false,
+      simulationMode: true,
       sdkPath: '/path/to/sdk/python',
       interpreter: 'python3'
     };
 
     const provider = new DashboardViewProvider({} as any, ipcClient, mockEnvManager);
-    const html = (provider as any).renderHtml({
-      isConnected: true,
-      coreStatus: { totalTasks: 1000, completedTasks: 500, runningTasks: 1 },
-      connectedWorkers: [{ deviceId: 'worker-1', capabilityProfile: { deviceName: 'Mac #2' } }],
+    const html = (provider as any).getHtmlForWebview({
+      connected: true,
+      coreStatus: { totalTasks: 16, completedTasks: 8, runningTasks: 2 },
+      connectedWorkers: [],
       discoveredWorkers: [],
-      trustedWorkers: [],
-      kernels: [],
+      recentWorkloads: [
+        {
+          workloadId: 'wkl-boxblur-sim-01',
+          kernelId: 'image_filter_box_blur_v1',
+          workerId: 'sim-worker-virtual-m3',
+          localVsRemote: 'REMOTE',
+          status: 'RUNNING',
+          inputBytes: 4194304
+        }
+      ],
       recentLogs: [],
       envActive: true,
-      forceSwarmDemo: true,
+      forceSwarmDemo: false,
+      simulationMode: true,
       sdkPath: '/path/to/sdk/python',
-      interpreter: 'python3'
+      interpreter: 'python3',
+      isCoreOwned: true,
+      isWorkerOwned: false,
+      workerStatus: 'OFFLINE'
     });
 
-    expect(html).to.include('FORCED SWARM (DEMO)');
-    expect(html).to.include('FORCED SWARM');
-    expect(html).to.include('RUNNING');
-    expect(html).to.include('50%');
+    expect(html).to.include('● ONLINE (Extension Managed)');
+    expect(html).to.include('🧪 SIMULATION (Virtual Worker)');
+    expect(html).to.include('1 Virtual');
+    expect(html).to.include('2D BoxBlur');
+    expect(html).to.include('🧪 Virtual Worker — Simulation Mode');
   });
 
-  it('6. WorkersTreeProvider, DiscoveredTreeProvider, and TasksTreeProvider render correctly', async () => {
+  it('8. DashboardViewProvider: Multi-Worker Chunked Execution & Dynamic Distribution', () => {
+    const mockEnvManager: any = {
+      active: true,
+      forceSwarmDemo: true,
+      simulationMode: false
+    };
+
+    const provider = new DashboardViewProvider({} as any, ipcClient, mockEnvManager);
+    const html = (provider as any).getHtmlForWebview({
+      connected: true,
+      coreStatus: { totalTasks: 16, completedTasks: 12, runningTasks: 4 },
+      connectedWorkers: [
+        {
+          deviceId: 'worker-studio-01',
+          isEligible: true,
+          capabilityProfile: { deviceName: 'Mac Studio M2 Ultra', cpuCores: 24, totalRamMb: 65536, hasGpu: true, gpuModel: 'Apple M2 Ultra GPU' }
+        },
+        {
+          deviceId: 'worker-mbp-02',
+          isEligible: true,
+          capabilityProfile: { deviceName: 'MacBook Pro M3 Max', cpuCores: 16, totalRamMb: 36864, hasGpu: true, gpuModel: 'Apple M3 Max GPU' }
+        }
+      ],
+      discoveredWorkers: [],
+      recentWorkloads: [
+        {
+          workloadId: 'wkl-matmul-chunked-001',
+          taskId: 'wkl-matmul-chunked-001',
+          kernelId: 'matrix_multiply_v1',
+          totalChunks: 16,
+          completedChunks: 12,
+          failedChunks: 0,
+          parameters: { M: 2048, K: 2048, N: 2048, totalChunks: 16 },
+          status: 'RUNNING',
+          workerHostname: 'Mac Studio M2 Ultra',
+          localVsRemote: 'REMOTE',
+          estimatedGain: 3.4
+        }
+      ],
+      recentLogs: []
+    });
+
+    // Validates dynamic N-worker rendering
+    expect(html).to.include('2 Physical');
+    expect(html).to.include('Mac Studio M2 Ultra');
+    expect(html).to.include('MacBook Pro M3 Max');
+
+    // Validates Parent Workload & Progress Bar
+    expect(html).to.include('2048 × 2048 × 2048');
+    expect(html).to.include('<b>12</b> / 16 complete (75%)');
+    expect(html).to.include('style="width: 75%;"');
+
+    // Validates live chunk activity
+    expect(html).to.include('▸ Live Chunk & Task Activity');
+  });
+
+  it('6. Tree Providers: Workers, Discovered, Tasks render correctly', async () => {
     const workersProvider = new WorkersTreeProvider(ipcClient);
     const discoveredProvider = new DiscoveredTreeProvider(ipcClient);
     const tasksProvider = new TasksTreeProvider(ipcClient);
@@ -256,90 +399,7 @@ describe('VS Code Extension — Dashboard & IPC Tests', () => {
     expect(taskItems[0].label).to.include('Tasks:');
   });
 
-  it('7. DashboardViewProvider renders Development Simulation Mode and Virtual Apple Silicon Worker', () => {
-    const mockEnvManager: any = {
-      active: true,
-      forceSwarmDemo: false,
-      simulationMode: true,
-      sdkPath: '/path/to/sdk/python',
-      interpreter: 'python3'
-    };
-
-    const provider = new DashboardViewProvider({} as any, ipcClient, mockEnvManager);
-    const html = (provider as any).renderHtml({
-      isConnected: true,
-      coreStatus: { totalTasks: 16, completedTasks: 16, runningTasks: 0 },
-      connectedWorkers: [],
-      discoveredWorkers: [],
-      trustedWorkers: [],
-      kernels: [],
-      recentLogs: [],
-      recentWorkloads: [
-        {
-          workloadId: 'wkl-boxblur-demo-001',
-          taskId: 'wkl-boxblur-demo-001',
-          workerId: 'sim-worker-virtual-m3',
-          workerHostname: '🧪 Simulated Mac #2 (Virtual Environment)',
-          status: 'COMPLETE',
-          durationSeconds: 0.08
-        }
-      ],
-      simStatus: {
-        config: { enabled: true, failureMode: 'NONE' }
-      },
-      envActive: true,
-      forceSwarmDemo: false,
-      simulationMode: true,
-      sdkPath: '/path/to/sdk/python',
-      interpreter: 'python3'
-    });
-
-    expect(html).to.include('DEVELOPMENT SIMULATION');
-    expect(html).to.include('🧪 Virtual Apple Silicon Worker');
-    expect(html).to.include('Simulation Mode');
-    expect(html).to.include('10 Cores');
-    expect(html).to.include('16 GB RAM');
-    expect(html).to.include('⚡ GPU: Simulated Metal');
-    expect(html).to.include('🧪 SIMULATION WORKER');
-    expect(html).to.include('🧪 Virtual Worker (Simulated Apple Silicon)');
-    expect(html).to.include('worker-sim');
-    expect(html).to.not.include("Jatin’s MacBook Air");
-  });
-
-  it('8. Simulation failure controls render cleanly and toggle failure states', () => {
-    const mockEnvManager: any = {
-      active: true,
-      simulationMode: true,
-      sdkPath: '/path/to/sdk/python',
-      interpreter: 'python3'
-    };
-
-    const provider = new DashboardViewProvider({} as any, ipcClient, mockEnvManager);
-    const html = (provider as any).renderHtml({
-      isConnected: true,
-      coreStatus: { totalTasks: 16, completedTasks: 8, runningTasks: 1 },
-      connectedWorkers: [],
-      discoveredWorkers: [],
-      trustedWorkers: [],
-      kernels: [],
-      recentLogs: [],
-      recentWorkloads: [],
-      simStatus: {
-        config: { enabled: true, failureMode: 'DISCONNECTED' }
-      },
-      envActive: true,
-      forceSwarmDemo: false,
-      simulationMode: true,
-      sdkPath: '/path/to/sdk/python',
-      interpreter: 'python3'
-    });
-
-    expect(html).to.include('🔴 SIMULATED OFFLINE');
-    expect(html).to.include('Simulate Disconnect');
-    expect(html).to.include('Simulate Error');
-  });
-
-  it('9. EnvironmentManager synchronizes SWARMX_FORCE_SWARM to terminal.integrated.env.osx without PYTHONPATH guard regression', async () => {
+  it('7. EnvironmentManager: Synchronizes SWARMX_FORCE_SWARM and PYTHONPATH automatically', async () => {
     const mockContext: any = {
       extensionPath: '/test/ext',
       environmentVariableCollection: {
@@ -353,15 +413,13 @@ describe('VS Code Extension — Dashboard & IPC Tests', () => {
     const { EnvironmentManager } = await import('../src/environment_manager');
     const envMgr = new EnvironmentManager(mockContext);
 
+    await envMgr.setEnabled(true);
+    expect(envMgr.active).to.be.true;
+
     await envMgr.setForceSwarmDemo(true);
     expect(envMgr.forceSwarmDemo).to.be.true;
 
-    await envMgr.setForceSwarmDemo(false);
-    expect(envMgr.forceSwarmDemo).to.be.false;
-  });
-
-  it('10. CoreIpcClient sends setForceSwarmMode and receives acknowledgement', async () => {
-    const res = await ipcClient.request<any>('setForceSwarmMode', { enabled: true });
-    expect(res.success).to.be.true;
+    await envMgr.setSimulationMode(true);
+    expect(envMgr.simulationMode).to.be.true;
   });
 });

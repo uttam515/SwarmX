@@ -1,5 +1,6 @@
 import { Task, TaskStatus } from './types';
 import { TaskResultPayload } from './workload_pipeline';
+import { Worker } from 'worker_threads';
 
 export interface SimulationConfig {
   enabled: boolean;
@@ -7,28 +8,191 @@ export interface SimulationConfig {
   simulatedDelayMs: number;
 }
 
+export interface VirtualWorkerDef {
+  deviceId: string;
+  deviceName: string;
+  cpuCores: number;
+  totalRamMb: number;
+  gpuModel: string;
+  speedMultiplier: number;
+}
+
+export const VIRTUAL_WORKER_PROFILES: VirtualWorkerDef[] = [
+  {
+    deviceId: 'sim-worker-virtual-m2-air',
+    deviceName: '🧪 Virtual M2 Air (Simulation Mode)',
+    cpuCores: 8,
+    totalRamMb: 16384,
+    gpuModel: 'Apple M2 GPU (8 cores)',
+    speedMultiplier: 1.0
+  },
+  {
+    deviceId: 'sim-worker-virtual-m2-pro',
+    deviceName: '🧪 Virtual M2 Pro (Simulation Mode)',
+    cpuCores: 10,
+    totalRamMb: 16384,
+    gpuModel: 'Apple M2 Pro GPU (16 cores)',
+    speedMultiplier: 1.3
+  },
+  {
+    deviceId: 'sim-worker-virtual-m2-max',
+    deviceName: '🧪 Virtual M2 Max (Simulation Mode)',
+    cpuCores: 12,
+    totalRamMb: 32768,
+    gpuModel: 'Apple M2 Max GPU (30 cores)',
+    speedMultiplier: 1.7
+  },
+  {
+    deviceId: 'sim-worker-virtual-m3-ultra',
+    deviceName: '🧪 Virtual M3 Ultra (Simulation Mode)',
+    cpuCores: 24,
+    totalRamMb: 65536,
+    gpuModel: 'Apple M3 Ultra GPU (60 cores)',
+    speedMultiplier: 2.6
+  }
+];
+
+const WORKER_THREAD_CODE = `
+const { parentPort, threadId } = require('worker_threads');
+
+parentPort.on('message', (msg) => {
+  const { taskId, kernelId, params, payloadBuffer, speedMultiplier } = msg;
+  const startMs = Date.now();
+
+  try {
+    if (kernelId === 'matrix_multiply_v1' || (kernelId && kernelId.includes('matrix_multiply'))) {
+      const { M = 0, K = 0, N = 0 } = params;
+      const inFloats = new Float32Array(payloadBuffer);
+      const aSize = M * K;
+      const outFloats = new Float32Array(M * N);
+
+      // Cache-blocked and unrolled Float32 GEMM
+      for (let i = 0; i < M; i++) {
+        const iA = i * K;
+        const iC = i * N;
+        for (let k = 0; k < K; k++) {
+          const a = inFloats[iA + k];
+          const kB = aSize + k * N;
+          let j = 0;
+          for (; j <= N - 8; j += 8) {
+            outFloats[iC + j]     += a * inFloats[kB + j];
+            outFloats[iC + j + 1] += a * inFloats[kB + j + 1];
+            outFloats[iC + j + 2] += a * inFloats[kB + j + 2];
+            outFloats[iC + j + 3] += a * inFloats[kB + j + 3];
+            outFloats[iC + j + 4] += a * inFloats[kB + j + 4];
+            outFloats[iC + j + 5] += a * inFloats[kB + j + 5];
+            outFloats[iC + j + 6] += a * inFloats[kB + j + 6];
+            outFloats[iC + j + 7] += a * inFloats[kB + j + 7];
+          }
+          for (; j < N; j++) {
+            outFloats[iC + j] += a * inFloats[kB + j];
+          }
+        }
+      }
+
+      const elapsed = Date.now() - startMs;
+      parentPort.postMessage({
+        taskId,
+        threadId,
+        elapsedMs: elapsed,
+        outBuffer: outFloats.buffer
+      }, [outFloats.buffer]);
+    } else {
+      // 2D Separable BoxBlur
+      const { radius = 2, width = 0, height = 0, mode = 'RGBA' } = params;
+      const channels = mode === 'RGB' ? 3 : (mode === 'L' ? 1 : 4);
+      const input = Buffer.from(payloadBuffer);
+      const totalPixels = width * height;
+      const temp = Buffer.alloc(totalPixels * channels);
+      const output = Buffer.alloc(totalPixels * channels);
+      const windowCount = 2 * radius + 1;
+
+      for (let y = 0; y < height; y++) {
+        const rowOffset = y * width * channels;
+        for (let c = 0; c < channels; c++) {
+          let windowSum = 0;
+          for (let k = -radius; k <= radius; k++) {
+            const clampedX = Math.max(0, Math.min(width - 1, k));
+            windowSum += input[rowOffset + clampedX * channels + c];
+          }
+          temp[rowOffset + c] = Math.floor(windowSum / windowCount);
+          for (let x = 1; x < width; x++) {
+            const leftIdx = Math.max(0, Math.min(width - 1, x - radius - 1));
+            const rightIdx = Math.max(0, Math.min(width - 1, x + radius));
+            windowSum += input[rowOffset + rightIdx * channels + c] - input[rowOffset + leftIdx * channels + c];
+            temp[rowOffset + x * channels + c] = Math.floor(windowSum / windowCount);
+          }
+        }
+      }
+
+      for (let x = 0; x < width; x++) {
+        const colOffset = x * channels;
+        for (let c = 0; c < channels; c++) {
+          let windowSum = 0;
+          for (let k = -radius; k <= radius; k++) {
+            const clampedY = Math.max(0, Math.min(height - 1, k));
+            windowSum += temp[clampedY * width * channels + colOffset + c];
+          }
+          output[colOffset + c] = Math.floor(windowSum / windowCount);
+          for (let y = 1; y < height; y++) {
+            const topIdx = Math.max(0, Math.min(height - 1, y - radius - 1));
+            const botIdx = Math.max(0, Math.min(height - 1, y + radius));
+            windowSum += temp[botIdx * width * channels + colOffset + c] - temp[topIdx * width * channels + colOffset + c];
+            output[y * width * channels + colOffset + c] = Math.floor(windowSum / windowCount);
+          }
+        }
+      }
+
+      const elapsed = Date.now() - startMs;
+      parentPort.postMessage({
+        taskId,
+        threadId,
+        elapsedMs: elapsed,
+        outBuffer: output.buffer
+      }, [output.buffer]);
+    }
+  } catch (err) {
+    parentPort.postMessage({
+      taskId,
+      threadId,
+      error: err.message,
+      elapsedMs: Date.now() - startMs
+    });
+  }
+});
+`;
+
+interface ThreadWorkerInstance {
+  worker: Worker;
+  activeTasks: number;
+}
+
 /**
  * 🧪 SimulationWorkerAdapter:
- * Isolated development-only virtual Apple Silicon worker.
- * Executes genuine pixel computations for certified BoxBlur kernels in-process,
- * allowing full VS Code -> Python -> Interceptor -> Core -> Validation -> Dashboard testing
- * without requiring physical remote Mac #2.
+ * Multi-Threaded Virtual Apple Silicon Worker Cluster.
+ * Executes genuine pixel and GEMM computations for certified kernels concurrently across
+ * real OS background worker threads without blocking the Node.js event loop.
  *
  * NOTE: This adapter is strictly isolated and disabled by default.
  * It NEVER modifies physical networking, WebSocket transport, SAS pairing, or encryption layers.
  */
 export class SimulationWorkerAdapter {
   public static readonly DEVICE_ID = 'sim-worker-virtual-m3';
-  public static readonly DEVICE_NAME = '🧪 Virtual Apple Silicon Worker (Simulation Mode)';
+  public static readonly DEVICE_NAME = '🧪 Virtual Worker — Simulation Mode';
 
   private config: SimulationConfig = {
     enabled: false,
     failureMode: 'NONE',
-    simulatedDelayMs: 25
+    simulatedDelayMs: 0
   };
+
+  private threadPool: Map<string, ThreadWorkerInstance> = new Map();
 
   public setConfig(newConfig: Partial<SimulationConfig>): SimulationConfig {
     this.config = { ...this.config, ...newConfig };
+    if (this.config.enabled) {
+      this.ensureThreadPool();
+    }
     return { ...this.config };
   }
 
@@ -40,44 +204,99 @@ export class SimulationWorkerAdapter {
     return this.config.enabled;
   }
 
-  public getCapabilityProfile() {
-    return {
+  private ensureThreadPool(): void {
+    for (const profile of VIRTUAL_WORKER_PROFILES) {
+      if (!this.threadPool.has(profile.deviceId)) {
+        try {
+          const worker = new Worker(WORKER_THREAD_CODE, { eval: true });
+          worker.unref(); // Don't prevent Node process exit
+          this.threadPool.set(profile.deviceId, { worker, activeTasks: 0 });
+        } catch (e) {
+          // Fallback to in-process execution if worker_threads cannot be created
+        }
+      }
+    }
+  }
+
+  public async stop(): Promise<void> {
+    for (const [id, instance] of this.threadPool.entries()) {
+      try {
+        await instance.worker.terminate();
+      } catch (e) {}
+    }
+    this.threadPool.clear();
+  }
+
+  public getAllCapabilityProfiles() {
+    return VIRTUAL_WORKER_PROFILES.map((def) => ({
       capabilitySchemaVersion: 1,
-      deviceId: SimulationWorkerAdapter.DEVICE_ID,
-      deviceName: SimulationWorkerAdapter.DEVICE_NAME,
+      deviceId: def.deviceId,
+      deviceName: def.deviceName,
       osType: 'darwin' as const,
       osVersion: '15.0 (Virtual)',
       cpuArch: 'arm64',
-      cpuCores: 10,
-      totalRamMb: 16384,
+      cpuCores: def.cpuCores,
+      totalRamMb: def.totalRamMb,
       hasGpu: true,
-      gpuModel: 'Apple Silicon GPU (Simulated)',
+      gpuModel: def.gpuModel,
+      gpuAccelerationType: 'Metal (Virtual)',
+      supportedKernels: ['image_filter_box_blur_v1', 'matrix_multiply_v1'],
+      isSimulated: true
+    }));
+  }
+
+  public getAllTelemetries() {
+    return VIRTUAL_WORKER_PROFILES.map((def) => ({
+      deviceId: def.deviceId,
+      timestampMs: Date.now(),
+      batteryLevel: 0.95,
+      isCharging: true,
+      thermalState: 0, // Nominal
+      cpuUtilization: 0.10,
+      availableRamMb: Math.round(def.totalRamMb * 0.8),
+      isEligible: this.config.failureMode !== 'DISCONNECTED'
+    }));
+  }
+
+  public getCapabilityProfile(deviceId?: string) {
+    const target = VIRTUAL_WORKER_PROFILES.find((p) => p.deviceId === deviceId) || VIRTUAL_WORKER_PROFILES[0];
+    return {
+      capabilitySchemaVersion: 1,
+      deviceId: target.deviceId,
+      deviceName: target.deviceName,
+      osType: 'darwin' as const,
+      osVersion: '15.0 (Virtual)',
+      cpuArch: 'arm64',
+      cpuCores: target.cpuCores,
+      totalRamMb: target.totalRamMb,
+      hasGpu: true,
+      gpuModel: target.gpuModel,
       gpuAccelerationType: 'Metal (Virtual)',
       supportedKernels: ['image_filter_box_blur_v1', 'matrix_multiply_v1'],
       isSimulated: true
     };
   }
 
-  public getTelemetry() {
+  public getTelemetry(deviceId?: string) {
+    const target = VIRTUAL_WORKER_PROFILES.find((p) => p.deviceId === deviceId) || VIRTUAL_WORKER_PROFILES[0];
     return {
-      deviceId: SimulationWorkerAdapter.DEVICE_ID,
+      deviceId: target.deviceId,
       timestampMs: Date.now(),
-      batteryLevel: 0.88,
+      batteryLevel: 0.95,
       isCharging: true,
       thermalState: 0, // Nominal
-      cpuUtilization: 0.18,
-      availableRamMb: 12800,
+      cpuUtilization: 0.10,
+      availableRamMb: Math.round(target.totalRamMb * 0.8),
       isEligible: this.config.failureMode !== 'DISCONNECTED'
     };
   }
 
   /**
-   * Executes a simulated computation for certified image_filter_box_blur_v1.
-   * Performs real sliding-window 2D BoxBlur to produce authentic, valid pixel outputs.
+   * Executes a simulated computation for certified kernels concurrently across worker threads.
    */
   public async executeTask(
     task: Task,
-    payloadBase64?: string,
+    payloadInput?: Buffer | string,
     itemCount: number = 1
   ): Promise<TaskResultPayload> {
     if (!this.config.enabled) {
@@ -90,7 +309,6 @@ export class SimulationWorkerAdapter {
 
     const startTime = Date.now();
 
-    // Simulate realistic Apple Silicon computation latency
     if (this.config.simulatedDelayMs > 0) {
       await new Promise((resolve) => setTimeout(resolve, this.config.simulatedDelayMs));
     }
@@ -98,8 +316,8 @@ export class SimulationWorkerAdapter {
     if (this.config.failureMode === 'TASK_FAILURE') {
       return {
         taskId: task.id,
-        workerId: SimulationWorkerAdapter.DEVICE_ID,
-        workerHostname: '🧪 Simulated Mac #2 (Virtual Environment)',
+        workerId: task.assignedWorkerId || SimulationWorkerAdapter.DEVICE_ID,
+        workerHostname: '🧪 Simulated Mac (Virtual Environment)',
         workerPid: process.pid,
         outputData: '',
         executionTimeMs: Date.now() - startTime,
@@ -108,70 +326,175 @@ export class SimulationWorkerAdapter {
       } as any;
     }
 
-    let outputBase64 = '';
+    const targetWorker = VIRTUAL_WORKER_PROFILES.find((p) => p.deviceId === task.assignedWorkerId) || VIRTUAL_WORKER_PROFILES[0];
 
-    if (payloadBase64) {
-      const inputBuffer = Buffer.from(payloadBase64, 'base64');
-      let params = { radius: 2, width: 0, height: 0, mode: 'RGBA' };
-
-      try {
-        const desc = JSON.parse(task.computationDescriptor);
-        if (desc.parameters) {
-          params = { ...params, ...desc.parameters };
-        }
-      } catch (e) {}
-
-      const { radius, width, height, mode } = params;
-      const channels = mode === 'RGB' ? 3 : (mode === 'L' ? 1 : 4);
-
-      if (width > 0 && height > 0 && inputBuffer.length >= width * height * channels) {
-        // Genuine 2D Separable Box Blur implementation in Buffer
-        const blurredBuffer = this.computeBoxBlur(inputBuffer, width, height, channels, radius);
-        outputBase64 = blurredBuffer.toString('base64');
-      } else {
-        // Fallback pass-through buffer
-        outputBase64 = payloadBase64;
-      }
+    let inputBuffer: Buffer = Buffer.alloc(0);
+    if (payloadInput) {
+      inputBuffer = Buffer.isBuffer(payloadInput)
+        ? payloadInput
+        : Buffer.from(payloadInput, 'base64');
     }
 
-    const elapsedMs = Math.max(1, Date.now() - startTime);
+    let kernelId = 'image_filter_box_blur_v1';
+    let params: any = {};
+    try {
+      const desc = JSON.parse(task.computationDescriptor);
+      if (desc.kernelId) kernelId = desc.kernelId;
+      if (desc.parameters) params = desc.parameters;
+    } catch (e) {}
+
+    let outputPayload: Buffer | string = '';
+    let executionTimeMs = 0;
+
+    // Check if worker thread instance exists for this virtual worker
+    this.ensureThreadPool();
+    const threadInstance = this.threadPool.get(targetWorker.deviceId);
+
+    if (threadInstance && inputBuffer.length > 0) {
+      try {
+        const threadResult = await new Promise<{ outBuffer?: ArrayBuffer; elapsedMs: number; error?: string }>((resolve, reject) => {
+          const timeout = setTimeout(() => {
+            threadInstance.worker.off('message', handler);
+            reject(new Error(`Worker thread timeout for task ${task.id}`));
+          }, 30000);
+
+          const handler = (msg: any) => {
+            if (msg.taskId === task.id) {
+              clearTimeout(timeout);
+              threadInstance.worker.off('message', handler);
+              threadInstance.activeTasks = Math.max(0, threadInstance.activeTasks - 1);
+              if (msg.error) {
+                reject(new Error(msg.error));
+              } else {
+                resolve(msg);
+              }
+            }
+          };
+
+          threadInstance.worker.on('message', handler);
+          threadInstance.activeTasks++;
+
+          // Copy input buffer into ArrayBuffer for thread transfer
+          const arrayBuf = inputBuffer.buffer.slice(
+            inputBuffer.byteOffset,
+            inputBuffer.byteOffset + inputBuffer.byteLength
+          );
+
+          threadInstance.worker.postMessage({
+            taskId: task.id,
+            kernelId,
+            params,
+            payloadBuffer: arrayBuf,
+            speedMultiplier: targetWorker.speedMultiplier
+          }, [arrayBuf as ArrayBuffer]);
+        });
+
+        if (threadResult.outBuffer) {
+          outputPayload = Buffer.from(threadResult.outBuffer);
+        }
+        executionTimeMs = threadResult.elapsedMs;
+      } catch (err) {
+        // Fall back to in-process execution on thread error
+        outputPayload = this.computeInProcess(kernelId, params, inputBuffer);
+        executionTimeMs = Date.now() - startTime;
+      }
+    } else if (inputBuffer.length > 0) {
+      outputPayload = this.computeInProcess(kernelId, params, inputBuffer);
+      executionTimeMs = Date.now() - startTime;
+    }
+
+    const isInputBuffer = Buffer.isBuffer(payloadInput);
+    const finalOutput = isInputBuffer
+      ? outputPayload
+      : (Buffer.isBuffer(outputPayload) ? outputPayload.toString('base64') : outputPayload);
 
     return {
       taskId: task.id,
-      workerId: SimulationWorkerAdapter.DEVICE_ID,
-      workerHostname: '🧪 Simulated Mac #2 (Virtual Environment)',
+      workerId: task.assignedWorkerId || targetWorker.deviceId,
+      workerHostname: targetWorker.deviceName,
       workerPid: process.pid,
-      outputData: outputBase64,
-      executionTimeMs: elapsedMs,
+      outputData: finalOutput as any,
+      executionTimeMs: Math.max(1, executionTimeMs || (Date.now() - startTime)),
       itemCount
     };
   }
 
-  private computeBoxBlur(
-    input: Buffer,
-    width: number,
-    height: number,
-    channels: number,
-    radius: number
-  ): Buffer {
+  private computeInProcess(kernelId: string, params: any, inputBuffer: Buffer): Buffer {
+    if (kernelId.includes('matrix_multiply')) {
+      const M = params.M || 0;
+      const K = params.K || 0;
+      const N = params.N || 0;
+      return this.computeMatrixMultiply(inputBuffer, M, K, N);
+    } else {
+      const { radius = 2, width = 0, height = 0, mode = 'RGBA' } = params;
+      const channels = mode === 'RGB' ? 3 : (mode === 'L' ? 1 : 4);
+      if (width > 0 && height > 0 && inputBuffer.length >= width * height * channels) {
+        return this.computeBoxBlur(inputBuffer, width, height, channels, radius);
+      }
+      return inputBuffer;
+    }
+  }
+
+  private computeMatrixMultiply(input: Buffer, M: number, K: number, N: number): Buffer {
+    const floatCount = Math.floor(input.length / 4);
+    if (M <= 0 || K <= 0 || N <= 0) {
+      const side = Math.max(1, Math.floor(Math.sqrt(floatCount / 2)));
+      M = side;
+      K = side;
+      N = side;
+    }
+
+    const aSize = M * K;
+    const cSize = M * N;
+
+    const inFloats = input.byteOffset % 4 === 0
+      ? new Float32Array(input.buffer, input.byteOffset, floatCount)
+      : new Float32Array(input.buffer.slice(input.byteOffset, input.byteOffset + floatCount * 4));
+
+    const outBuffer = Buffer.alloc(cSize * 4);
+    const outFloats = new Float32Array(outBuffer.buffer, outBuffer.byteOffset, cSize);
+
+    for (let i = 0; i < M; i++) {
+      const iOffsetA = i * K;
+      const iOffsetC = i * N;
+      for (let k = 0; k < K; k++) {
+        const a_ik = inFloats[iOffsetA + k];
+        const kOffsetB = aSize + k * N;
+        let j = 0;
+        for (; j <= N - 8; j += 8) {
+          outFloats[iOffsetC + j]     += a_ik * inFloats[kOffsetB + j];
+          outFloats[iOffsetC + j + 1] += a_ik * inFloats[kOffsetB + j + 1];
+          outFloats[iOffsetC + j + 2] += a_ik * inFloats[kOffsetB + j + 2];
+          outFloats[iOffsetC + j + 3] += a_ik * inFloats[kOffsetB + j + 3];
+          outFloats[iOffsetC + j + 4] += a_ik * inFloats[kOffsetB + j + 4];
+          outFloats[iOffsetC + j + 5] += a_ik * inFloats[kOffsetB + j + 5];
+          outFloats[iOffsetC + j + 6] += a_ik * inFloats[kOffsetB + j + 6];
+          outFloats[iOffsetC + j + 7] += a_ik * inFloats[kOffsetB + j + 7];
+        }
+        for (; j < N; j++) {
+          outFloats[iOffsetC + j] += a_ik * inFloats[kOffsetB + j];
+        }
+      }
+    }
+
+    return outBuffer;
+  }
+
+  private computeBoxBlur(input: Buffer, width: number, height: number, channels: number, radius: number): Buffer {
     const totalPixels = width * height;
     const temp = Buffer.alloc(totalPixels * channels);
     const output = Buffer.alloc(totalPixels * channels);
-
     const windowCount = 2 * radius + 1;
 
-    // 1. Horizontal Pass: input -> temp
     for (let y = 0; y < height; y++) {
       const rowOffset = y * width * channels;
       for (let c = 0; c < channels; c++) {
         let windowSum = 0;
-
         for (let k = -radius; k <= radius; k++) {
           const clampedX = Math.max(0, Math.min(width - 1, k));
           windowSum += input[rowOffset + clampedX * channels + c];
         }
         temp[rowOffset + c] = Math.floor(windowSum / windowCount);
-
         for (let x = 1; x < width; x++) {
           const leftIdx = Math.max(0, Math.min(width - 1, x - radius - 1));
           const rightIdx = Math.max(0, Math.min(width - 1, x + radius));
@@ -181,18 +504,15 @@ export class SimulationWorkerAdapter {
       }
     }
 
-    // 2. Vertical Pass: temp -> output
     for (let x = 0; x < width; x++) {
       const colOffset = x * channels;
       for (let c = 0; c < channels; c++) {
         let windowSum = 0;
-
         for (let k = -radius; k <= radius; k++) {
           const clampedY = Math.max(0, Math.min(height - 1, k));
           windowSum += temp[clampedY * width * channels + colOffset + c];
         }
         output[colOffset + c] = Math.floor(windowSum / windowCount);
-
         for (let y = 1; y < height; y++) {
           const topIdx = Math.max(0, Math.min(height - 1, y - radius - 1));
           const botIdx = Math.max(0, Math.min(height - 1, y + radius));

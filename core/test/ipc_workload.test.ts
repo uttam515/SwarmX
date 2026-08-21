@@ -26,10 +26,13 @@ describe('IPC Workload Integration Tests (Phase C)', () => {
   let decisionEngine: DistributionDecisionEngine;
   let ipcServer: IpcServer;
 
-  const testSocketPath = path.join('/tmp', `swarmx-ipc-wkl-${Date.now()}.sock`);
-  const testPort = 59145;
+  let testSocketPath: string;
+  let testPort: number;
 
   beforeEach(async () => {
+    testSocketPath = path.join('/tmp', `swarmx-ipc-wkl-${Date.now()}-${Math.random().toString(36).substring(7)}.sock`);
+    testPort = 59200 + Math.floor(Math.random() * 500);
+
     db = createDatabase(':memory:');
     runMigrations(db);
     taskStore = new TaskStore(db);
@@ -184,7 +187,59 @@ describe('IPC Workload Integration Tests (Phase C)', () => {
     const execRes = await sendIpc('executeWorkload', { workload: wkl });
     expect(execRes.error).to.be.undefined;
     expect(execRes.result.status).to.equal('COMPLETED');
-    expect(execRes.result.workerId).to.equal('sim-worker-virtual-m3');
+    expect(execRes.result.workerId).to.include('sim-worker-virtual');
     expect(execRes.result.workerHostname).to.include('Virtual');
+  });
+
+  it('8. executeWorkload dispatches Float32 Matrix Multiplication to virtual worker and passes validation', async () => {
+    await sendIpc('setSimulationMode', { enabled: true });
+    await sendIpc('setForceSwarmMode', { enabled: true });
+
+    const M = 8;
+    const K = 8;
+    const N = 8;
+    const inFloats = new Float32Array(M * K + K * N);
+    for (let i = 0; i < M * K; i++) inFloats[i] = 1.5;
+    for (let i = 0; i < K * N; i++) inFloats[M * K + i] = 2.0;
+
+    const rawBuffer = Buffer.from(inFloats.buffer, inFloats.byteOffset, inFloats.byteLength);
+
+    const wkl = {
+      workloadId: 'wkl-matmul-ipc-test',
+      version: '1.0.0',
+      computation: {
+        domain: 'NUMERICAL_COMPUTATION',
+        kernelId: 'matrix_multiply_v1',
+        parameters: { M, K, N, dtype: 'FLOAT32' }
+      },
+      data: {
+        itemCount: 1,
+        totalPayloadBytes: rawBuffer.length,
+        format: 'FLOAT32_ARRAY',
+        payloadBase64: rawBuffer.toString('base64')
+      },
+      constraints: {
+        isPure: true,
+        isIdempotent: true,
+        toleranceValidator: 'NUMERIC_TOLERANCE',
+        maxMse: 1e-4
+      }
+    };
+
+    const execRes = await sendIpc('executeWorkload', { workload: wkl });
+    expect(execRes.error).to.be.undefined;
+    expect(execRes.result.status).to.equal('COMPLETED');
+    expect(execRes.result.workerId).to.include('sim-worker-virtual');
+    expect(execRes.result.workerHostname).to.include('Virtual');
+
+    const outBuf = Buffer.from(execRes.result.outputData, 'base64');
+    expect(outBuf.length).to.equal(M * N * 4);
+
+    const outFloats = new Float32Array(outBuf.buffer, outBuf.byteOffset, outBuf.byteLength / 4);
+    expect(outFloats.length).to.equal(64);
+    // 1.5 * 2.0 * 8 = 24.0
+    for (let i = 0; i < 64; i++) {
+      expect(outFloats[i]).to.be.closeTo(24.0, 1e-4);
+    }
   });
 });

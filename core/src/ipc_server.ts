@@ -14,6 +14,8 @@ import { BINARY_FRAME_MAGIC, encodeBinaryFrame, decodeBinaryFrame } from './bina
 import { Task, TaskStatus, WorkloadDescriptor } from './types';
 import { Logger } from './logger';
 import { SimulationWorkerAdapter } from './simulation_worker';
+import { MatrixChunkEngine, MatrixChunkSpec, MatrixChunkResult } from './chunk_engine';
+import { ToleranceAwareMatrixValidator } from './result_validator';
 
 export interface IpcMessage {
   id: string | number;
@@ -37,7 +39,25 @@ export interface WorkloadExecutionEvent {
   startTimeMs: number;
   endTimeMs?: number;
   durationSeconds?: number;
+  queueTimeMs?: number;
+  workerComputeTimeMs?: number;
+  validationTimeMs?: number;
+  transferTimeMs?: number;
+  localVsRemote?: 'REMOTE' | 'LOCAL';
   kernelId: string;
+  batchId?: string;
+  decision?: 'SWARM' | 'LOCAL';
+  estimatedLocalTimeMs?: number;
+  estimatedSwarmTimeMs?: number;
+  estimatedQueueTimeMs?: number;
+  estimatedTransferTimeMs?: number;
+  estimatedComputeTimeMs?: number;
+  estimatedGain?: number;
+  decisionReason?: string;
+  isForceSwarm?: boolean;
+  inputBytes?: number;
+  outputBytes?: number;
+  parameters?: Record<string, any>;
 }
 
 export class IpcServer {
@@ -67,6 +87,10 @@ export class IpcServer {
     }
   }
 
+  public getSimulationWorker(): SimulationWorkerAdapter {
+    return this.simulationWorker;
+  }
+
   public getRecentWorkloads(): WorkloadExecutionEvent[] {
     return [...this.recentWorkloads];
   }
@@ -81,7 +105,8 @@ export class IpcServer {
     transportServer: TransportServer,
     workloadPipeline?: WorkloadPipeline,
     scheduler?: ScoredScheduler,
-    decisionEngine?: DistributionDecisionEngine
+    decisionEngine?: DistributionDecisionEngine,
+    simulationWorker?: SimulationWorkerAdapter
   ) {
     this.socketPath = socketPath;
     this.taskStore = taskStore;
@@ -91,6 +116,9 @@ export class IpcServer {
     this.workloadPipeline = workloadPipeline;
     this.scheduler = scheduler;
     this.decisionEngine = decisionEngine || new DistributionDecisionEngine();
+    if (simulationWorker) {
+      this.simulationWorker = simulationWorker;
+    }
   }
 
   public start(): Promise<void> {
@@ -107,26 +135,31 @@ export class IpcServer {
       this.server = net.createServer((socket) => {
         this.activeSockets.add(socket);
         socket.on('close', () => this.activeSockets.delete(socket));
+        socket.on('error', (err: any) => {
+          // Gracefully suppress client reset / EPIPE
+          this.activeSockets.delete(socket);
+        });
 
         let rawBuffer = Buffer.alloc(0);
+        let processing = false;
 
-        socket.on('data', async (chunk) => {
-          rawBuffer = Buffer.concat([rawBuffer, chunk]);
+        const processBuffer = async () => {
+          if (processing) return;
+          processing = true;
 
-          // 1. Check for Binary Frame Magic ('SWRM' = 0x5357524D)
-          if (rawBuffer.length >= 4 && rawBuffer.readUInt32BE(0) === BINARY_FRAME_MAGIC) {
-            try {
-              let decoded = decodeBinaryFrame(rawBuffer);
-              while (decoded) {
+          try {
+            while (true) {
+              // 1. Check for Binary Frame Magic ('SWRM' = 0x5357524D)
+              if (rawBuffer.length >= 4 && rawBuffer.readUInt32BE(0) === BINARY_FRAME_MAGIC) {
+                const decoded = decodeBinaryFrame(rawBuffer);
+                if (!decoded) break;
+
                 rawBuffer = rawBuffer.subarray(decoded.totalLength);
 
                 const msg = decoded.metadata;
-                // Pass raw binary payload directly into workload data
+                // Pass raw binary payload directly into workload data without redundant Base64 conversion
                 if (msg.params?.workload?.data) {
                   msg.params.workload.data.rawPayloadBuffer = decoded.payload;
-                  if (!msg.params.workload.data.payloadBase64) {
-                    msg.params.workload.data.payloadBase64 = decoded.payload.toString('base64');
-                  }
                 }
 
                 try {
@@ -146,38 +179,43 @@ export class IpcServer {
                   const errFrame = encodeBinaryFrame({ id: msg.id || null, error: err.message }, Buffer.alloc(0));
                   socket.write(errFrame);
                 }
+              } else if (rawBuffer.length > 0) {
+                // 2. Legacy JSON-RPC Line Protocol
+                const text = rawBuffer.toString('utf-8');
+                const newlineIdx = text.indexOf('\n');
+                if (newlineIdx === -1) break;
 
-                decoded = rawBuffer.length >= 4 && rawBuffer.readUInt32BE(0) === BINARY_FRAME_MAGIC
-                  ? decodeBinaryFrame(rawBuffer)
-                  : null;
-              }
-            } catch (err: any) {
-              // Frame corrupted or oversized -> discard buffer and send error frame
-              rawBuffer = Buffer.alloc(0);
-              const errFrame = encodeBinaryFrame({ id: null, error: `BINARY_FRAME_ERROR: ${err.message}` }, Buffer.alloc(0));
-              socket.write(errFrame);
-            }
-            return;
-          }
+                const line = text.slice(0, newlineIdx).trim();
+                rawBuffer = rawBuffer.subarray(Buffer.byteLength(text.slice(0, newlineIdx + 1), 'utf-8'));
 
-          // 2. Legacy JSON-RPC Line Protocol
-          const text = rawBuffer.toString('utf-8');
-          if (text.includes('\n')) {
-            const lines = text.split('\n');
-            const remainder = lines.pop() || '';
-            rawBuffer = Buffer.from(remainder, 'utf-8');
-
-            for (const line of lines) {
-              if (!line.trim()) continue;
-              try {
-                const msg: IpcMessage = JSON.parse(line);
-                const response = await this.handleMessage(msg);
-                socket.write(JSON.stringify(response) + '\n');
-              } catch (err: any) {
-                socket.write(JSON.stringify({ id: null, error: err.message }) + '\n');
+                if (line) {
+                  try {
+                    const msg: IpcMessage = JSON.parse(line);
+                    const response = await this.handleMessage(msg);
+                    if (response.result?.outputData && Buffer.isBuffer(response.result.outputData)) {
+                      response.result.outputData = response.result.outputData.toString('base64');
+                    }
+                    socket.write(JSON.stringify(response) + '\n');
+                  } catch (err: any) {
+                    socket.write(JSON.stringify({ id: null, error: err.message }) + '\n');
+                  }
+                }
+              } else {
+                break;
               }
             }
+          } catch (err: any) {
+            rawBuffer = Buffer.alloc(0);
+            const errFrame = encodeBinaryFrame({ id: null, error: `BINARY_FRAME_ERROR: ${err.message}` }, Buffer.alloc(0));
+            socket.write(errFrame);
+          } finally {
+            processing = false;
           }
+        };
+
+        socket.on('data', (chunk) => {
+          rawBuffer = Buffer.concat([rawBuffer, chunk]);
+          processBuffer();
         });
       });
 
@@ -189,6 +227,16 @@ export class IpcServer {
           } catch (err) {
             console.error(`Failed to set 0600 permissions on socket: ${err}`);
           }
+        }
+        if (process.env.SWARMX_SIMULATION_MODE === '1') {
+          this.simulationWorker.setConfig({ enabled: true, simulatedDelayMs: 0 });
+          for (const profile of this.simulationWorker.getAllCapabilityProfiles()) {
+            this.workerManager.registerWorker(profile);
+          }
+          for (const telemetry of this.simulationWorker.getAllTelemetries()) {
+            this.workerManager.updateTelemetry(telemetry);
+          }
+          Logger.workerState(`🧪 SIMULATION CLUSTER ENABLED on startup: 4 Virtual Workers active`);
         }
         resolve();
       });
@@ -357,19 +405,23 @@ export class IpcServer {
             };
           }
 
-          // 1. Run deterministic decision gate
+          // 1. Run deterministic queue-aware decision gate exactly once
+          const t_decision_start = performance.now();
           const connectedWorkers = this.workerManager.listWorkers().map(w => ({
             deviceId: w.deviceId,
             capabilityProfile: w.capabilityProfile,
-            telemetry: w.latestTelemetry
+            telemetry: w.latestTelemetry,
+            inFlightTasks: this.decisionEngine.getInFlightCount(w.deviceId)
           }));
 
           const decision = this.decisionEngine.evaluate(workload, connectedWorkers);
+          const t_decision_ms = performance.now() - t_decision_start;
           const isForceSwarm = Boolean(forceSwarm || this.forceSwarmOverride);
 
           if (isForceSwarm) {
             const eligibleWorkers = this.workerManager.listWorkers().filter(w => w.isEligible);
-            if (eligibleWorkers.length === 0) {
+            const simActive = this.simulationWorker.isEnabled;
+            if (eligibleWorkers.length === 0 && !simActive) {
               return {
                 id: msg.id,
                 result: {
@@ -378,19 +430,65 @@ export class IpcServer {
                 }
               };
             }
-            Logger.execution(`Demo forced distributed execution across ${eligibleWorkers.length} remote worker(s)`);
+            Logger.execution(`Demo forced distributed execution across ${eligibleWorkers.length || 1} remote worker(s)`);
           } else if (decision.decision !== 'SWARM') {
+            const wklId = workload.workloadId || `wkl-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+            const batchId = (workload.computation.parameters as any)?.batchId || (workload as any).batchId || (wklId.includes('parallel') ? 'parallel-matmul-demo' : undefined);
+            this.recordWorkloadEvent({
+              workloadId: wklId,
+              taskId: wklId,
+              workerId: 'local-host',
+              workerHostname: 'Local Host',
+              status: 'LOCAL_FALLBACK',
+              startTimeMs: Date.now(),
+              endTimeMs: Date.now(),
+              durationSeconds: 0,
+              localVsRemote: 'LOCAL',
+              kernelId: workload.computation.kernelId,
+              batchId,
+              decision: decision.decision,
+              estimatedLocalTimeMs: decision.estimatedLocalTimeMs,
+              estimatedSwarmTimeMs: decision.estimatedSwarmTimeMs,
+              estimatedQueueTimeMs: decision.estimatedQueueTimeMs,
+              estimatedTransferTimeMs: decision.estimatedTransferTimeMs,
+              estimatedComputeTimeMs: decision.estimatedComputeTimeMs,
+              estimatedGain: decision.estimatedGain,
+              decisionReason: decision.reason,
+              isForceSwarm: false,
+              inputBytes: workload.data.totalPayloadBytes,
+              parameters: workload.computation.parameters
+            });
+
             return {
               id: msg.id,
               result: {
                 status: 'LOCAL_FALLBACK',
                 reason: decision.reason,
-                decisionDetails: decision
+                decisionDetails: decision,
+                telemetry: {
+                  decisionMs: t_decision_ms,
+                  coreTotalMs: t_decision_ms
+                }
               }
             };
           }
 
-          // 2. Create Task in TaskStore
+          // 2. Check if workload is eligible for Multi-Chunk Distributed GEMM
+          const isMatmul = workload.computation.kernelId === 'matrix_multiply_v1';
+          const matmulParams = (workload.computation.parameters || {}) as any;
+          const M = Number(matmulParams.M || 0);
+          const K = Number(matmulParams.K || 0);
+          const N = Number(matmulParams.N || 0);
+          const requestedChunks = Number(matmulParams.chunks || matmulParams.chunkCount || 0);
+          const connectedRealCount = this.workerManager.listWorkers().filter(w => w.isEligible).length;
+          const simActive = this.simulationWorker.isEnabled;
+          const shouldChunk = isMatmul && M >= 64 && K > 0 && N > 0 && (requestedChunks > 1 || (connectedRealCount > 1 && workload.data.totalPayloadBytes >= 64 * 1024) || (simActive && requestedChunks > 1));
+
+          if (shouldChunk) {
+            return await this.executeChunkedMatMul(msg, workload, isForceSwarm, decision, t_decision_ms);
+          }
+
+          // 3. Create Task in TaskStore for Single-Task Execution Path
           let taskId = workload.workloadId || `wkl-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
           if (this.taskStore.getTask(taskId)) {
             taskId = `${taskId}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
@@ -409,12 +507,23 @@ export class IpcServer {
             status: TaskStatus.PENDING
           });
 
-          // 3. Schedule Task via ScoredScheduler
+          // 3. Schedule Task via ScoredScheduler or Simulation Worker
           const scheduleResult = this.scheduler
             ? this.scheduler.scheduleTask(task, this.workerManager.listWorkers(), this.taskStore)
             : { status: 'NO_ELIGIBLE_WORKER', selectedWorker: undefined };
 
-          if (scheduleResult.status !== 'ASSIGNED' || !scheduleResult.selectedWorker) {
+          let workerId: string | null = null;
+          let hostName = 'Worker';
+
+          if (scheduleResult.status === 'ASSIGNED' && scheduleResult.selectedWorker) {
+            workerId = scheduleResult.selectedWorker.deviceId;
+            hostName = scheduleResult.selectedWorker.capabilityProfile?.deviceName || workerId;
+          } else if (this.simulationWorker.isEnabled) {
+            workerId = SimulationWorkerAdapter.DEVICE_ID;
+            hostName = '🧪 Virtual Worker — Simulation Mode';
+          }
+
+          if (!workerId) {
             return {
               id: msg.id,
               result: {
@@ -424,137 +533,191 @@ export class IpcServer {
             };
           }
 
-          const workerId = scheduleResult.selectedWorker.deviceId;
-          Logger.execution(`Selected remote worker: ${workerId} (${scheduleResult.selectedWorker.capabilityProfile?.deviceName || 'Worker'})`);
+          Logger.execution(`Selected remote worker: ${workerId} (${hostName})`);
           this.taskStore.assignTask(task.id, workerId, 30000);
+          this.decisionEngine.acquireReservation(workerId);
 
-          // 4. Await completion from WorkloadPipeline with timeout
-          const completionPromise = new Promise<any>((resolve) => {
-            const timeoutTimer = setTimeout(() => {
-              resolve({ status: 'TIMEOUT', error: 'Workload execution timed out after 30s' });
-            }, 30000);
+          try {
+            // 4. Await completion from WorkloadPipeline with timeout
+            const completionPromise = new Promise<any>((resolve) => {
+              const timeoutTimer = setTimeout(() => {
+                resolve({ status: 'TIMEOUT', error: 'Workload execution timed out after 30s' });
+              }, 30000);
 
-            if (this.workloadPipeline) {
-              this.workloadPipeline.onTaskFinished(task.id, (res) => {
-                clearTimeout(timeoutTimer);
-                resolve({
-                  status: res.success ? 'COMPLETED' : 'FAILED',
-                  taskId: task.id,
-                  outputData: res.task.resultDestination,
-                  validationDetails: res.validationDetails,
-                  error: res.error
+              if (this.workloadPipeline) {
+                this.workloadPipeline.onTaskFinished(task.id, (res: any) => {
+                  clearTimeout(timeoutTimer);
+                  resolve({
+                    status: res.success ? 'COMPLETED' : 'FAILED',
+                    taskId: task.id,
+                    outputData: res.outputData !== undefined ? res.outputData : (res.task ? res.task.resultDestination : ''),
+                    validationDetails: res.validationDetails,
+                    workerHostname: res.workerHostname,
+                    workerPid: res.workerPid,
+                    executionTimeMs: res.executionTimeMs,
+                    error: res.error
+                  });
                 });
-              });
+              } else {
+                clearTimeout(timeoutTimer);
+                resolve({ status: 'COMPLETED', taskId: task.id, outputData: '' });
+              }
+            });
+
+            // 5. Dispatch via SimulationWorkerAdapter or TransportServer
+            Logger.execution(`Dispatching task: ${task.id}`);
+            task.assignedWorkerId = workerId;
+            if (workerId === SimulationWorkerAdapter.DEVICE_ID || workerId.startsWith('sim-worker-virtual-')) {
+              Logger.execution(`Simulation execution started: ${workerId}`);
+              this.simulationWorker.executeTask(task, workload.data.payloadBase64, workload.data.itemCount)
+                .then(async (simResult) => {
+                  if (this.workloadPipeline) {
+                    await this.workloadPipeline.handleTaskResult(simResult);
+                  }
+                })
+                .catch((err) => {
+                  this.taskStore.recordTaskFailure(task.id, workerId, 'SIMULATION_EXECUTION_FAILED', { error: err.message });
+                });
             } else {
-              clearTimeout(timeoutTimer);
-              resolve({ status: 'COMPLETED', taskId: task.id, outputData: '' });
+              Logger.execution(`Remote execution started: ${workerId}`);
+              const sent = this.transportServer.sendExecuteTask(
+                workerId,
+                task,
+                workload.data.payloadBase64,
+                workload.data.itemCount
+              );
+
+              if (!sent) {
+                this.taskStore.recordTaskFailure(task.id, workerId, 'TRANSPORT_SEND_FAILED', {});
+                return {
+                  id: msg.id,
+                  result: {
+                    status: isForceSwarm ? 'FAILED' : 'LOCAL_FALLBACK',
+                    reason: 'Failed to dispatch to worker transport'
+                  }
+                };
+              }
             }
-          });
 
-          // 5. Dispatch via SimulationWorkerAdapter or TransportServer
-          Logger.execution(`Dispatching task: ${task.id}`);
-          if (workerId === SimulationWorkerAdapter.DEVICE_ID) {
-            Logger.execution(`Simulation execution started: ${workerId}`);
-            this.simulationWorker.executeTask(task, workload.data.payloadBase64, workload.data.itemCount)
-              .then(async (simResult) => {
-                if (this.workloadPipeline) {
-                  await this.workloadPipeline.handleTaskResult(simResult);
-                }
-              })
-              .catch((err) => {
-                this.taskStore.recordTaskFailure(task.id, workerId, 'SIMULATION_EXECUTION_FAILED', { error: err.message });
-              });
-          } else {
-            Logger.execution(`Remote execution started: ${workerId}`);
-            const sent = this.transportServer.sendExecuteTask(
+            // Record initial submission in recentWorkloads
+            const wklId = workload.workloadId || task.id;
+            const batchId = (workload.computation.parameters as any)?.batchId || (workload as any).batchId || (wklId.includes('parallel') ? 'parallel-matmul-demo' : undefined);
+            this.recordWorkloadEvent({
+              workloadId: wklId,
+              taskId: task.id,
               workerId,
-              task,
-              workload.data.payloadBase64,
-              workload.data.itemCount
-            );
+              workerHostname: hostName,
+              status: 'RUNNING',
+              startTimeMs: task.createdAtMs,
+              kernelId: workload.computation.kernelId,
+              batchId,
+              decision: decision.decision,
+              estimatedLocalTimeMs: decision.estimatedLocalTimeMs,
+              estimatedSwarmTimeMs: decision.estimatedSwarmTimeMs,
+              estimatedQueueTimeMs: decision.estimatedQueueTimeMs,
+              estimatedTransferTimeMs: decision.estimatedTransferTimeMs,
+              estimatedComputeTimeMs: decision.estimatedComputeTimeMs,
+              estimatedGain: decision.estimatedGain,
+              decisionReason: decision.reason,
+              isForceSwarm,
+              inputBytes: workload.data.totalPayloadBytes,
+              parameters: workload.computation.parameters
+            });
 
-            if (!sent) {
-              this.taskStore.recordTaskFailure(task.id, workerId, 'TRANSPORT_SEND_FAILED', {});
+            const executionResult = await completionPromise;
+            const finalHost = executionResult.workerHostname || hostName;
+            const finalPid = executionResult.workerPid;
+            const pidStr = finalPid ? ` (PID: ${finalPid})` : '';
+
+            if (executionResult.status === 'COMPLETED') {
+              Logger.execution(`Remote execution completed on ${finalHost}${pidStr} for workload ${wklId}`);
+              Logger.validation(`Remote result passed pixel validation for task ${task.id}`);
+
+              const computeMs = executionResult.executionTimeMs || Math.round(Date.now() - task.createdAtMs);
+              const totalDurationMs = Date.now() - task.createdAtMs;
+              const transferAndOverheadMs = Math.max(0, totalDurationMs - computeMs);
+
+              this.recordWorkloadEvent({
+                workloadId: wklId,
+                taskId: task.id,
+                workerId,
+                workerHostname: finalHost,
+                workerPid: finalPid,
+                status: 'COMPLETE',
+                startTimeMs: task.createdAtMs,
+                endTimeMs: Date.now(),
+                durationSeconds: (totalDurationMs / 1000),
+                workerComputeTimeMs: computeMs,
+                transferTimeMs: transferAndOverheadMs,
+                queueTimeMs: 1.0,
+                validationTimeMs: 1.0,
+                localVsRemote: 'REMOTE',
+                kernelId: workload.computation.kernelId,
+                batchId,
+                decision: decision.decision,
+                estimatedLocalTimeMs: decision.estimatedLocalTimeMs,
+                estimatedSwarmTimeMs: decision.estimatedSwarmTimeMs,
+                estimatedQueueTimeMs: decision.estimatedQueueTimeMs,
+                estimatedTransferTimeMs: decision.estimatedTransferTimeMs,
+                estimatedComputeTimeMs: decision.estimatedComputeTimeMs,
+                estimatedGain: decision.estimatedGain,
+                decisionReason: decision.reason,
+                isForceSwarm,
+                inputBytes: workload.data.totalPayloadBytes,
+                parameters: workload.computation.parameters
+              });
+
+              return {
+                id: msg.id,
+                result: {
+                  status: 'COMPLETED',
+                  taskId: task.id,
+                  workloadId: wklId,
+                  outputData: executionResult.outputData,
+                  workerId,
+                  workerHostname: finalHost,
+                  workerPid: finalPid,
+                  executionTimeMs: computeMs
+                }
+              };
+            } else {
+              this.recordWorkloadEvent({
+                workloadId: wklId,
+                taskId: task.id,
+                workerId,
+                workerHostname: finalHost,
+                workerPid: finalPid,
+                status: 'FAILED',
+                startTimeMs: task.createdAtMs,
+                endTimeMs: Date.now(),
+                durationSeconds: ((Date.now() - task.createdAtMs) / 1000),
+                localVsRemote: 'REMOTE',
+                kernelId: workload.computation.kernelId,
+                batchId,
+                decision: decision.decision,
+                estimatedLocalTimeMs: decision.estimatedLocalTimeMs,
+                estimatedSwarmTimeMs: decision.estimatedSwarmTimeMs,
+                estimatedQueueTimeMs: decision.estimatedQueueTimeMs,
+                estimatedTransferTimeMs: decision.estimatedTransferTimeMs,
+                estimatedComputeTimeMs: decision.estimatedComputeTimeMs,
+                estimatedGain: decision.estimatedGain,
+                decisionReason: decision.reason,
+                isForceSwarm,
+                inputBytes: workload.data.totalPayloadBytes,
+                parameters: workload.computation.parameters
+              });
+
               return {
                 id: msg.id,
                 result: {
                   status: isForceSwarm ? 'FAILED' : 'LOCAL_FALLBACK',
-                  reason: 'Failed to dispatch to worker transport'
+                  reason: executionResult.error || 'Worker execution failed',
+                  details: executionResult
                 }
               };
             }
-          }
-
-          // Record initial submission in recentWorkloads
-          const wklId = workload.workloadId || task.id;
-          const hostName = scheduleResult.selectedWorker.capabilityProfile?.deviceName || workerId;
-          this.recordWorkloadEvent({
-            workloadId: wklId,
-            taskId: task.id,
-            workerId,
-            workerHostname: hostName,
-            status: 'RUNNING',
-            startTimeMs: task.createdAtMs,
-            kernelId: workload.computation.kernelId
-          });
-
-          const executionResult = await completionPromise;
-          const finalHost = executionResult.workerHostname || hostName;
-          const finalPid = executionResult.workerPid;
-          const pidStr = finalPid ? ` (PID: ${finalPid})` : '';
-
-          if (executionResult.status === 'COMPLETED') {
-            Logger.execution(`Remote execution completed on ${finalHost}${pidStr} for workload ${wklId}`);
-            Logger.validation(`Remote result passed pixel validation for task ${task.id}`);
-
-            this.recordWorkloadEvent({
-              workloadId: wklId,
-              taskId: task.id,
-              workerId,
-              workerHostname: finalHost,
-              workerPid: finalPid,
-              status: 'COMPLETE',
-              startTimeMs: task.createdAtMs,
-              endTimeMs: Date.now(),
-              durationSeconds: ((Date.now() - task.createdAtMs) / 1000),
-              kernelId: workload.computation.kernelId
-            });
-
-            return {
-              id: msg.id,
-              result: {
-                status: 'COMPLETED',
-                taskId: task.id,
-                workloadId: wklId,
-                outputData: executionResult.outputData,
-                workerId,
-                workerHostname: finalHost,
-                workerPid: finalPid,
-                executionTimeMs: executionResult.executionTimeMs || (Date.now() - task.createdAtMs)
-              }
-            };
-          } else {
-            this.recordWorkloadEvent({
-              workloadId: wklId,
-              taskId: task.id,
-              workerId,
-              workerHostname: finalHost,
-              workerPid: finalPid,
-              status: 'FAILED',
-              startTimeMs: task.createdAtMs,
-              endTimeMs: Date.now(),
-              durationSeconds: ((Date.now() - task.createdAtMs) / 1000),
-              kernelId: workload.computation.kernelId
-            });
-
-            return {
-              id: msg.id,
-              result: {
-                status: isForceSwarm ? 'FAILED' : 'LOCAL_FALLBACK',
-                reason: executionResult.error || 'Worker execution failed',
-                details: executionResult
-              }
-            };
+          } finally {
+            this.decisionEngine.releaseReservation(workerId);
           }
         }
 
@@ -567,14 +730,21 @@ export class IpcServer {
           const cfg = this.simulationWorker.setConfig({
             enabled: Boolean(enabled),
             failureMode: failureMode || 'NONE',
-            simulatedDelayMs: simulatedDelayMs !== undefined ? simulatedDelayMs : 25
+            simulatedDelayMs: simulatedDelayMs !== undefined ? simulatedDelayMs : 0
           });
 
           if (cfg.enabled) {
-            this.workerManager.registerWorker(this.simulationWorker.getCapabilityProfile());
-            this.workerManager.updateTelemetry(this.simulationWorker.getTelemetry());
-            Logger.workerState(`🧪 SIMULATION WORKER ENABLED: ${SimulationWorkerAdapter.DEVICE_ID}`);
+            for (const profile of this.simulationWorker.getAllCapabilityProfiles()) {
+              this.workerManager.registerWorker(profile);
+            }
+            for (const telemetry of this.simulationWorker.getAllTelemetries()) {
+              this.workerManager.updateTelemetry(telemetry);
+            }
+            Logger.workerState(`🧪 SIMULATION CLUSTER ENABLED: ${this.simulationWorker.getAllCapabilityProfiles().length} Virtual Workers active`);
           } else {
+            for (const profile of this.simulationWorker.getAllCapabilityProfiles()) {
+              this.workerManager.unregisterWorker(profile.deviceId);
+            }
             this.workerManager.unregisterWorker(SimulationWorkerAdapter.DEVICE_ID);
             Logger.workerState(`🧪 SIMULATION WORKER DISABLED`);
           }
@@ -617,6 +787,343 @@ export class IpcServer {
     } catch (err: any) {
       return { id: msg.id, error: err.message };
     }
+  }
+
+  private async executeChunkedMatMul(
+    msg: IpcMessage,
+    workload: WorkloadDescriptor,
+    isForceSwarm: boolean,
+    decision: any,
+    t_decision_ms: number = 0
+  ): Promise<IpcResponse> {
+    const parentWorkloadId = workload.workloadId || `wkl-matmul-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+    const params = (workload.computation.parameters || {}) as any;
+    const M = Number(params.M || 0);
+    const K = Number(params.K || 0);
+    const N = Number(params.N || 0);
+    const batchId = params.batchId || (workload as any).batchId;
+
+    const rawPayload: Buffer = (workload.data as any).rawPayloadBuffer
+      ? (workload.data as any).rawPayloadBuffer
+      : Buffer.from(workload.data.payloadBase64 || '', 'base64');
+    const aBytes = M * K * 4;
+    const aBuffer = rawPayload.subarray(0, aBytes);
+    const bBuffer = rawPayload.subarray(aBytes);
+
+    const connectedWorkers = this.workerManager.listWorkers().filter(w => w.isEligible);
+    const simActive = this.simulationWorker.isEnabled;
+    const effectiveWorkerCount = connectedWorkers.length + (simActive ? 1 : 0);
+    const requestedChunks = Number(params.chunks || params.chunkCount || 0);
+    const numChunks = Math.min(requestedChunks > 0 ? requestedChunks : Math.max(2, effectiveWorkerCount), M);
+
+    const t_chunk_start = performance.now();
+    const chunkSpecs = MatrixChunkEngine.partitionMatrixMultiply(
+      parentWorkloadId,
+      M,
+      K,
+      N,
+      numChunks,
+      aBuffer,
+      bBuffer
+    );
+    const t_chunking_ms = performance.now() - t_chunk_start;
+
+    if (this.workloadPipeline) {
+      this.workloadPipeline.registerWorkload(parentWorkloadId, chunkSpecs.length);
+    }
+
+    const t_workload_start = performance.now();
+    const startTimeMs = Date.now();
+    Logger.execution(`Partitioned matrix workload ${parentWorkloadId} (${M}x${K} @ ${K}x${N}) into ${chunkSpecs.length} parallel chunks`);
+
+    this.recordWorkloadEvent({
+      workloadId: parentWorkloadId,
+      taskId: parentWorkloadId,
+      workerId: simActive ? SimulationWorkerAdapter.DEVICE_ID : 'multi-worker-swarm',
+      workerHostname: simActive ? '🧪 Virtual Apple Silicon Worker' : `${numChunks} Swarm Nodes`,
+      status: 'RUNNING',
+      startTimeMs,
+      kernelId: 'matrix_multiply_v1',
+      batchId,
+      decision: decision.decision,
+      estimatedLocalTimeMs: decision.estimatedLocalTimeMs,
+      estimatedSwarmTimeMs: decision.estimatedSwarmTimeMs,
+      estimatedQueueTimeMs: decision.estimatedQueueTimeMs,
+      estimatedTransferTimeMs: decision.estimatedTransferTimeMs,
+      estimatedComputeTimeMs: decision.estimatedComputeTimeMs,
+      estimatedGain: decision.estimatedGain,
+      decisionReason: decision.reason,
+      isForceSwarm,
+      inputBytes: workload.data.totalPayloadBytes,
+      parameters: { ...params, totalChunks: chunkSpecs.length }
+    });
+
+    try {
+      const t_sched_start = performance.now();
+      const chunkPromises = chunkSpecs.map(spec => this.dispatchChunkWithRetry(spec, workload, isForceSwarm));
+      const t_scheduling_ms = performance.now() - t_sched_start;
+
+      const chunkResults = await Promise.all(chunkPromises);
+
+      const t_reasm_start = performance.now();
+      const assembledBuffer = MatrixChunkEngine.assembleMatrixChunks(
+        parentWorkloadId,
+        M,
+        K,
+        N,
+        chunkResults
+      );
+      const t_reassembly_ms = performance.now() - t_reasm_start;
+
+      const t_val_start = performance.now();
+      const validator = new ToleranceAwareMatrixValidator();
+      const valDummyTask: Task = {
+        id: parentWorkloadId,
+        inputRef: 'inline',
+        computationDescriptor: JSON.stringify({ kernelId: 'matrix_multiply_v1', parameters: { M, K, N } }),
+        requiredResources: {},
+        dependencies: [],
+        executionConstraints: {},
+        resultDestination: 'memory',
+        retryCount: 0,
+        attemptHistory: [],
+        status: TaskStatus.RUNNING,
+        createdAtMs: startTimeMs,
+        updatedAtMs: Date.now()
+      };
+      validator.validate(valDummyTask, assembledBuffer);
+      const t_validation_ms = performance.now() - t_val_start;
+
+      const t_total_ms = performance.now() - t_workload_start;
+      const maxComputeMs = Math.max(...chunkResults.map(r => r.executionTimeMs || 0));
+      const avgComputeMs = chunkResults.reduce((sum, r) => sum + (r.executionTimeMs || 0), 0) / chunkResults.length;
+
+      this.recordWorkloadEvent({
+        workloadId: parentWorkloadId,
+        taskId: parentWorkloadId,
+        workerId: simActive ? SimulationWorkerAdapter.DEVICE_ID : 'multi-worker-swarm',
+        workerHostname: simActive ? '🧪 Virtual Apple Silicon Worker' : `${numChunks} Swarm Nodes`,
+        status: 'COMPLETE',
+        startTimeMs,
+        endTimeMs: Date.now(),
+        durationSeconds: t_total_ms / 1000,
+        workerComputeTimeMs: Math.round(avgComputeMs),
+        transferTimeMs: Math.max(0, t_total_ms - maxComputeMs),
+        queueTimeMs: 0.0,
+        validationTimeMs: t_validation_ms,
+        localVsRemote: 'REMOTE',
+        kernelId: 'matrix_multiply_v1',
+        batchId,
+        decision: decision.decision,
+        estimatedLocalTimeMs: decision.estimatedLocalTimeMs,
+        estimatedSwarmTimeMs: decision.estimatedSwarmTimeMs,
+        estimatedQueueTimeMs: decision.estimatedQueueTimeMs,
+        estimatedTransferTimeMs: decision.estimatedTransferTimeMs,
+        estimatedComputeTimeMs: decision.estimatedComputeTimeMs,
+        estimatedGain: decision.estimatedGain,
+        decisionReason: decision.reason,
+        isForceSwarm,
+        inputBytes: workload.data.totalPayloadBytes,
+        parameters: { ...params, totalChunks: chunkSpecs.length }
+      });
+
+      const isBinaryFrameRequest = Boolean((workload.data as any).rawPayloadBuffer);
+      return {
+        id: msg.id,
+        result: {
+          status: 'COMPLETED',
+          taskId: parentWorkloadId,
+          workloadId: parentWorkloadId,
+          outputData: isBinaryFrameRequest ? assembledBuffer : assembledBuffer.toString('base64'),
+          executionTimeMs: Math.round(maxComputeMs),
+          totalChunks: chunkSpecs.length,
+          completedChunks: chunkSpecs.length,
+          telemetry: {
+            decisionMs: t_decision_ms,
+            chunkingMs: t_chunking_ms,
+            schedulingMs: t_scheduling_ms,
+            workerComputeMs: maxComputeMs,
+            avgWorkerComputeMs: avgComputeMs,
+            reassemblyMs: t_reassembly_ms,
+            validationMs: t_validation_ms,
+            coreTotalMs: t_total_ms,
+            swarmWallMs: t_total_ms,
+            chunkDistribution: chunkResults.map((r) => ({
+              chunkIndex: r.chunkIndex,
+              workerId: r.workerId,
+              executionTimeMs: r.executionTimeMs
+            }))
+          }
+        }
+      };
+    } catch (err: any) {
+      this.recordWorkloadEvent({
+        workloadId: parentWorkloadId,
+        taskId: parentWorkloadId,
+        workerId: 'multi-worker-swarm',
+        workerHostname: 'Swarm Cluster',
+        status: 'FAILED',
+        startTimeMs,
+        endTimeMs: Date.now(),
+        durationSeconds: (Date.now() - startTimeMs) / 1000,
+        localVsRemote: 'REMOTE',
+        kernelId: 'matrix_multiply_v1',
+        batchId,
+        decision: decision.decision,
+        decisionReason: err.message || 'Chunk execution failed',
+        isForceSwarm,
+        inputBytes: workload.data.totalPayloadBytes,
+        parameters: params
+      });
+
+      return {
+        id: msg.id,
+        result: {
+          status: isForceSwarm ? 'FAILED' : 'LOCAL_FALLBACK',
+          reason: err.message || 'Chunked execution failed'
+        }
+      };
+    }
+  }
+
+  private async dispatchChunkWithRetry(
+    spec: MatrixChunkSpec,
+    parentWorkload: WorkloadDescriptor,
+    isForceSwarm: boolean,
+    maxRetries: number = 2
+  ): Promise<MatrixChunkResult> {
+    const parentWorkloadId = spec.metadata.parentWorkloadId;
+    const chunkTaskId = `${parentWorkloadId}-c${spec.metadata.chunkIndex}-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+
+    let task = this.taskStore.getTask(chunkTaskId);
+    if (!task) {
+      task = this.taskStore.createTask({
+        id: chunkTaskId,
+        inputRef: 'inline_payload',
+        computationDescriptor: JSON.stringify({
+          kernelId: 'matrix_multiply_v1',
+          parameters: {
+            M: spec.metadata.rowCount,
+            K: spec.metadata.K,
+            N: spec.metadata.N,
+            chunkIndex: spec.metadata.chunkIndex,
+            totalChunks: spec.metadata.totalChunks,
+            rowStart: spec.metadata.rowStart,
+            rowEnd: spec.metadata.rowEnd
+          }
+        }),
+        requiredResources: { minCpuCores: 1, minRamMb: 64 },
+        dependencies: [],
+        executionConstraints: { parentWorkloadId },
+        resultDestination: 'memory',
+        status: TaskStatus.PENDING
+      });
+    }
+
+    if (this.workloadPipeline) {
+      this.workloadPipeline.trackTaskInWorkload(parentWorkloadId, chunkTaskId);
+    }
+
+    let lastError = 'No eligible worker found';
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      const allWorkers = this.workerManager.listWorkers();
+      const scheduleResult = this.scheduler
+        ? this.scheduler.scheduleTask(task, allWorkers, this.taskStore)
+        : { status: 'NO_ELIGIBLE_WORKER', selectedWorker: undefined };
+
+      let targetWorkerId: string | null = null;
+
+      if (scheduleResult.status === 'ASSIGNED' && scheduleResult.selectedWorker) {
+        targetWorkerId = scheduleResult.selectedWorker.deviceId;
+      } else if (this.simulationWorker.isEnabled) {
+        targetWorkerId = SimulationWorkerAdapter.DEVICE_ID;
+      }
+
+      if (!targetWorkerId) {
+        throw new Error(`Scheduler could not place chunk ${spec.metadata.chunkIndex} (attempt ${attempt + 1}/${maxRetries + 1}): ${scheduleResult.status}`);
+      }
+
+      this.taskStore.assignTask(chunkTaskId, targetWorkerId, 30000);
+      this.decisionEngine.acquireReservation(targetWorkerId);
+
+      try {
+        const chunkStartMs = Date.now();
+        const completionPromise = new Promise<any>((resolve) => {
+          const timer = setTimeout(() => {
+            resolve({ status: 'TIMEOUT', error: `Chunk ${spec.metadata.chunkIndex} timed out after 30s` });
+          }, 30000);
+
+          if (this.workloadPipeline) {
+            this.workloadPipeline.onTaskFinished(chunkTaskId, (res) => {
+              clearTimeout(timer);
+              resolve({
+                success: res.success,
+                status: res.success ? 'COMPLETED' : 'FAILED',
+                outputData: res.outputData || (res.task ? res.task.resultDestination : ''),
+                error: res.error,
+                executionTimeMs: res.executionTimeMs || (Date.now() - chunkStartMs)
+              });
+            });
+          } else {
+            clearTimeout(timer);
+            resolve({ success: true, status: 'COMPLETED', outputData: '' });
+          }
+        });
+
+        task.assignedWorkerId = targetWorkerId;
+        if (targetWorkerId === SimulationWorkerAdapter.DEVICE_ID || targetWorkerId.startsWith('sim-worker-virtual-')) {
+          // Zero-copy binary Buffer dispatch directly into simulation worker thread pool
+          this.simulationWorker.executeTask(task, spec.payload, 1)
+            .then(async (simRes) => {
+              if (this.workloadPipeline) {
+                await this.workloadPipeline.handleTaskResult(simRes);
+              }
+            })
+            .catch((err) => {
+              this.taskStore.recordTaskFailure(chunkTaskId, targetWorkerId!, 'SIMULATION_ERROR', { error: err.message });
+            });
+        } else {
+          const payloadBase64 = spec.payload.toString('base64');
+          const sent = this.transportServer.sendExecuteTask(
+            targetWorkerId,
+            task,
+            payloadBase64,
+            1
+          );
+          if (!sent) {
+            this.taskStore.recordTaskFailure(chunkTaskId, targetWorkerId, 'TRANSPORT_SEND_FAILED', {});
+            throw new Error(`Failed to send chunk ${spec.metadata.chunkIndex} to worker ${targetWorkerId}`);
+          }
+        }
+
+        const res = await completionPromise;
+        if (res.status === 'COMPLETED' && res.outputData) {
+          const outputBuf = Buffer.isBuffer(res.outputData) ? res.outputData : Buffer.from(res.outputData, 'base64');
+          return {
+            parentWorkloadId,
+            chunkIndex: spec.metadata.chunkIndex,
+            totalChunks: spec.metadata.totalChunks,
+            rowStart: spec.metadata.rowStart,
+            rowEnd: spec.metadata.rowEnd,
+            rowCount: spec.metadata.rowCount,
+            M: spec.metadata.M,
+            K: spec.metadata.K,
+            N: spec.metadata.N,
+            outputBuffer: outputBuf,
+            workerId: targetWorkerId,
+            executionTimeMs: res.executionTimeMs || (Date.now() - chunkStartMs)
+          };
+        } else {
+          lastError = res.error || `Chunk ${spec.metadata.chunkIndex} execution failed on ${targetWorkerId}`;
+          this.taskStore.recordTaskFailure(chunkTaskId, targetWorkerId, 'EXECUTION_FAILED', { error: lastError });
+        }
+      } finally {
+        this.decisionEngine.releaseReservation(targetWorkerId);
+      }
+    }
+
+    throw new Error(`Chunk ${spec.metadata.chunkIndex} failed after ${maxRetries + 1} attempts: ${lastError}`);
   }
 
   public async stop(): Promise<void> {

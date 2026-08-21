@@ -112,6 +112,9 @@ export class TransportServer {
           proto: 'grpc-ws'
         }
       });
+      this.bonjourService.on('error', (err: any) => {
+        // Suppress benign mDNS service name duplicate warnings in test environments
+      });
       Logger.transport(`Bonjour service published: '${serviceName}' (_swarmx._tcp.local) on port ${this.port} (IPv4)`);
     } catch (e) {
       console.warn('mDNS publish warning:', e);
@@ -395,13 +398,27 @@ export class TransportServer {
     }
     if (this.bonjourService) {
       try {
-        this.bonjourService.stop();
+        await new Promise<void>((resolve) => {
+          try {
+            this.bonjourService!.stop(() => resolve());
+          } catch (e) {
+            resolve();
+          }
+        });
       } catch (e) {}
+      this.bonjourService = null;
     }
     if (this.bonjour) {
       try {
-        this.bonjour.destroy();
+        await new Promise<void>((resolve) => {
+          try {
+            this.bonjour!.destroy(() => resolve());
+          } catch (e) {
+            resolve();
+          }
+        });
       } catch (e) {}
+      this.bonjour = null;
     }
     if (this.wss) {
       for (const client of this.wss.clients) {

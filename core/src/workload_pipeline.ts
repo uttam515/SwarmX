@@ -1,6 +1,6 @@
 import { TaskStore } from './db/task_store';
 import { Task, TaskStatus, IResultValidator } from './types';
-import { PassThroughValidator } from './result_validator';
+import { PassThroughValidator, ToleranceAwareMatrixValidator } from './result_validator';
 import { ScoredScheduler } from './scheduler';
 
 export interface TaskResultPayload {
@@ -18,6 +18,7 @@ export interface TaskProcessingResult {
   success: boolean;
   status: TaskStatus;
   task: Task;
+  outputData?: Buffer | string;
   error?: string;
   validationDetails?: any;
   workerHostname?: string;
@@ -148,6 +149,9 @@ export class WorkloadPipeline {
     if (taskType && this.validators.has(taskType)) {
       return this.validators.get(taskType)!;
     }
+    if (taskType && taskType.includes('matrix_multiply')) {
+      return new ToleranceAwareMatrixValidator();
+    }
     return this.defaultValidator;
   }
 
@@ -196,8 +200,20 @@ export class WorkloadPipeline {
     let processingResult: TaskProcessingResult;
     if (validation.isValid) {
       // 1. Successful Validation: Complete Task
-      const resultDataStr = typeof payload.outputData === 'string' ? payload.outputData : payload.outputData.toString('base64');
-      const completedTask = this.taskStore.completeTask(task.id, resultDataStr);
+      // Store lightweight reference in SQLite to avoid multi-megabyte DB payload allocations
+      const isBuffer = Buffer.isBuffer(payload.outputData);
+      let resultDestinationRef: string;
+      if (isBuffer) {
+        resultDestinationRef = `memory://${task.id}`;
+      } else if (typeof payload.outputData === 'string' && payload.outputData.length > 1024) {
+        resultDestinationRef = `memory://${task.id}`;
+      } else if (typeof payload.outputData === 'string') {
+        resultDestinationRef = payload.outputData;
+      } else {
+        resultDestinationRef = `memory://${task.id}`;
+      }
+
+      const completedTask = this.taskStore.completeTask(task.id, resultDestinationRef);
 
       // Calibrate worker throughput telemetry on scheduler using EMA
       if (payload.itemCount && payload.executionTimeMs > 0) {
@@ -217,6 +233,7 @@ export class WorkloadPipeline {
         success: true,
         status: TaskStatus.COMPLETED,
         task: completedTask,
+        outputData: payload.outputData,
         validationDetails: validation.details,
         workerHostname: payload.workerHostname,
         workerPid: payload.workerPid,

@@ -6,12 +6,23 @@ and transparently offloads to SwarmX Core with zero application code modificatio
 
 import os
 import sys
-import uuid
+import time
+import threading
 from typing import Any, Tuple
 
 _ORIGINAL_NUMPY_MATMUL = None
 _ORIGINAL_NDARRAY_MATMUL = None
 _INTERCEPTOR_INSTALLED = False
+_MATMUL_COUNTER = 0
+_COUNTER_LOCK = threading.Lock()
+
+def _next_workload_id(kernel_name: str = "matmul") -> str:
+    global _MATMUL_COUNTER
+    with _COUNTER_LOCK:
+        _MATMUL_COUNTER += 1
+        count = _MATMUL_COUNTER
+    prefix = os.environ.get("SWARMX_WORKLOAD_PREFIX", "wkl")
+    return f"{prefix}-{kernel_name}-demo-{count:03d}"
 
 def is_certified_matmul(a: Any, b: Any) -> Tuple[bool, str]:
     """
@@ -44,15 +55,9 @@ def is_certified_matmul(a: Any, b: Any) -> Tuple[bool, str]:
 
     return True, "Valid certified matmul"
 
-_GLOBAL_CLIENT = None
-
 def _get_client(socket_path: str):
-    global _GLOBAL_CLIENT
-    if _GLOBAL_CLIENT is None or not _GLOBAL_CLIENT.is_connected():
-        from swarmx.client import SwarmClient
-        _GLOBAL_CLIENT = SwarmClient(socket_path=socket_path)
-        _GLOBAL_CLIENT.connect()
-    return _GLOBAL_CLIENT
+    from swarmx.client import get_thread_local_client
+    return get_thread_local_client(socket_path=socket_path)
 
 def swarmx_matmul(a: Any, b: Any, *args, **kwargs) -> Any:
     """
@@ -66,6 +71,9 @@ def swarmx_matmul(a: Any, b: Any, *args, **kwargs) -> Any:
             return _ORIGINAL_NUMPY_MATMUL(a, b, *args, **kwargs)
         import numpy as np
         return np.matmul(a, b, *args, **kwargs)
+
+    if os.environ.get("SWARMX_BYPASS") == "1":
+        return _ORIGINAL_NUMPY_MATMUL(a, b)
 
     debug = os.environ.get("SWARMX_DEBUG") == "1"
 
@@ -81,7 +89,7 @@ def swarmx_matmul(a: Any, b: Any, *args, **kwargs) -> Any:
     K_b, N = b.shape
 
     # 2. Check Core Socket Availability
-    socket_path = os.environ.get("SWARMX_SOCKET_PATH", "/tmp/swarmx.sock")
+    socket_path = os.environ.get("SWARMX_IPC_PATH", os.environ.get("SWARMX_SOCKET_PATH", "/tmp/swarmx.sock"))
     if not os.path.exists(socket_path):
         if debug:
             print("⚠️ [SwarmX Matmul] Core socket offline -> executing via native NumPy")
@@ -97,7 +105,7 @@ def swarmx_matmul(a: Any, b: Any, *args, **kwargs) -> Any:
 
         # 3. Construct platform-neutral Workload IR
         workload_ir = {
-            "workloadId": f"wkl-matmul-{uuid.uuid4().hex[:8]}-{M}x{N}",
+            "workloadId": _next_workload_id("matmul"),
             "version": "1.0.0",
             "computation": {
                 "domain": "NUMERICAL_COMPUTATION",
@@ -122,34 +130,49 @@ def swarmx_matmul(a: Any, b: Any, *args, **kwargs) -> Any:
             }
         }
 
-        # 4. Evaluate Cost Model
-        eval_res = client.evaluate_workload(workload_ir)
-        decision = eval_res.get("decision")
-        if debug:
-            print(f"🔍 [SwarmX Decision] Matmul Evaluated: {decision} (Reason: {eval_res.get('reason')})")
+        force_swarm = os.environ.get("SWARMX_FORCE_SWARM") == "1"
 
-        if decision != "SWARM":
-            return _ORIGINAL_NUMPY_MATMUL(a, b)
+        # 4. Dispatch via Single-Round-Trip Zero-Copy Binary Execution Path
+        # (Core evaluates decision internally and returns LOCAL_FALLBACK if local is faster)
+        t_intercept_start = time.perf_counter()
 
-        # 5. Dispatch via Zero-Copy Binary Execution Path (Milestone 2.1)
         if debug:
             print(f"🚀 [SwarmX Matmul] Offloading {M}x{K} @ {K}x{N} ({payload_bytes:,} bytes) to SwarmX Core...")
 
         raw_payload = a.tobytes() + b.tobytes()
-        exec_res, out_bytes = client.execute_workload_binary(workload_ir, raw_payload)
+        exec_res, out_bytes = client.execute_workload_binary(workload_ir, raw_payload, force_swarm=force_swarm)
+
+        global _LAST_EXECUTION_RESULT
+        _LAST_EXECUTION_RESULT = exec_res
+
+        if exec_res.get("status") == "LOCAL_FALLBACK" and not force_swarm:
+            if debug:
+                print(f"🔍 [SwarmX Matmul] Core indicated LOCAL_FALLBACK ({exec_res.get('reason')}) -> executing via native NumPy")
+            return _ORIGINAL_NUMPY_MATMUL(a, b)
 
         if exec_res.get("status") == "COMPLETED" and len(out_bytes) == output_bytes_expected:
-            if debug:
-                print("✅ [SwarmX Matmul] Received valid binary buffer from Swarm -> reconstructing numpy.ndarray")
-            # Reconstruct ndarray from raw buffer
+            t_recon_start = time.perf_counter()
             out_array = np.frombuffer(out_bytes, dtype=np.float32).reshape((M, N)).copy()
+            t_recon_end = time.perf_counter()
+
+            if "telemetry" in exec_res:
+                exec_res["telemetry"]["pythonReconstructMs"] = (t_recon_end - t_recon_start) * 1000.0
+                exec_res["telemetry"]["pythonTotalMs"] = (t_recon_end - t_intercept_start) * 1000.0
+
+            if debug:
+                print("✅ [SwarmX Matmul] Received valid binary buffer from Swarm -> reconstructed numpy.ndarray")
             return out_array
+
+        if force_swarm:
+            raise RuntimeError(f"ERROR: Forced Swarm matmul execution failed: {exec_res.get('reason', 'Remote worker execution error')}")
 
         if debug:
             print(f"⚠️ [SwarmX Matmul] Execution fallback triggered: {exec_res.get('reason')} -> executing via native NumPy")
         return _ORIGINAL_NUMPY_MATMUL(a, b)
 
     except Exception as e:
+        if os.environ.get("SWARMX_FORCE_SWARM") == "1":
+            raise
         if debug:
             print(f"⚠️ [SwarmX Error] Exception during matmul interception: {e} -> falling back to native NumPy")
         return _ORIGINAL_NUMPY_MATMUL(a, b)
@@ -177,3 +200,8 @@ def uninstall_interceptor():
             _INTERCEPTOR_INSTALLED = False
         except ImportError:
             pass
+
+def get_last_execution_result():
+    """Returns telemetry and metadata of the most recent intercepted execution."""
+    global _LAST_EXECUTION_RESULT
+    return _LAST_EXECUTION_RESULT

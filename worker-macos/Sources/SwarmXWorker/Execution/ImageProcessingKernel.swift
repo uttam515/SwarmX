@@ -1,4 +1,5 @@
 import Foundation
+import Accelerate
 
 public struct TaskPayload: Codable {
     public let taskId: String
@@ -92,49 +93,68 @@ public class ImageProcessingKernel {
                 outputDataString = processedBytes.base64EncodedString()
             } else if payload.computationDescriptor.contains("gaussian_blur") {
                 // 2. Certified image_filter_gaussian_blur_v1 (3-pass separable box approximation / binomial)
-                var width = 0
-                var height = 0
-                var channels = 4
+                let width = 0
+                let height = 0
+                let channels = 4
                 let totalPixels = rawBytes.count / channels
                 let side = Int(Double(totalPixels).squareRoot())
-                width = side
-                height = side
 
                 // Standard Gaussian filter approximation (2-pass box blur)
-                let pass1 = ImageProcessingKernel.applyBoxBlur(input: rawBytes, width: width, height: height, channels: channels, radius: 2)
-                let pass2 = ImageProcessingKernel.applyBoxBlur(input: pass1, width: width, height: height, channels: channels, radius: 2)
+                let pass1 = ImageProcessingKernel.applyBoxBlur(input: rawBytes, width: side, height: side, channels: channels, radius: 2)
+                let pass2 = ImageProcessingKernel.applyBoxBlur(input: pass1, width: side, height: side, channels: channels, radius: 2)
                 outputDataString = pass2.base64EncodedString()
             } else if payload.computationDescriptor.contains("matrix_multiply") {
-                // 3. Certified matrix_multiply_v1 (Float32 GEMM)
+                // 3. Certified matrix_multiply_v1 (Float32 GEMM via Apple Accelerate cblas_sgemm)
+                var m = 0
+                var k = 0
+                var n = 0
+
+                if let descData = payload.computationDescriptor.data(using: .utf8),
+                   let json = try? JSONSerialization.jsonObject(with: descData) as? [String: Any] {
+                    let params = (json["parameters"] as? [String: Any]) ?? json
+                    m = (params["M"] as? Int) ?? (params["m"] as? Int) ?? 0
+                    k = (params["K"] as? Int) ?? (params["k"] as? Int) ?? 0
+                    n = (params["N"] as? Int) ?? (params["n"] as? Int) ?? 0
+                }
+
                 let floatCount = rawBytes.count / 4
-                let side = Int(Double(floatCount / 2).squareRoot()) // Two matrices A and B of side x side
-                let n = max(1, side)
-                
-                var a = [Float](repeating: 0, count: n * n)
-                var b = [Float](repeating: 0, count: n * n)
-                var c = [Float](repeating: 0, count: n * n)
-
-                rawBytes.withUnsafeBytes { ptr in
-                    let fPtr = ptr.bindMemory(to: Float.self)
-                    for i in 0..<min(n * n, floatCount) {
-                        a[i] = fPtr[i]
-                    }
-                    for i in 0..<min(n * n, max(0, floatCount - n * n)) {
-                        b[i] = fPtr[n * n + i]
-                    }
+                if m <= 0 || k <= 0 || n <= 0 || (m * k + k * n) > floatCount {
+                    let side = Int(Double(floatCount / 2).squareRoot())
+                    m = max(1, side)
+                    k = m
+                    n = m
                 }
 
-                // C = A * B
-                for i in 0..<n {
-                    for k in 0..<n {
-                        let aik = a[i * n + k]
-                        for j in 0..<n {
-                            c[i * n + j] += aik * b[k * n + j]
-                        }
-                    }
+                let aCount = m * k
+                let cCount = m * n
+                var c = [Float](repeating: 0, count: cCount)
+
+                rawBytes.withUnsafeBytes { rawPtr in
+                    guard let fPtr = rawPtr.bindMemory(to: Float.self).baseAddress else { return }
+                    let aPtr = fPtr
+                    let bPtr = fPtr.advanced(by: aCount)
+
+                    // Apple Accelerate cblas_sgemm: C = 1.0 * A * B + 0.0 * C
+                    // Row-Major: A is M x K (lda = K), B is K x N (ldb = N), C is M x N (ldc = N)
+                    cblas_sgemm(
+                        CblasRowMajor,
+                        CblasNoTrans,
+                        CblasNoTrans,
+                        Int32(m),
+                        Int32(n),
+                        Int32(k),
+                        1.0,
+                        aPtr,
+                        Int32(k),
+                        bPtr,
+                        Int32(n),
+                        0.0,
+                        &c,
+                        Int32(n)
+                    )
                 }
 
-                let outData = Data(bytes: c, count: n * n * 4)
+                let outData = Data(bytes: c, count: cCount * 4)
                 outputDataString = outData.base64EncodedString()
             } else {
                 // Default legacy filters (invert, grayscale, scaling)

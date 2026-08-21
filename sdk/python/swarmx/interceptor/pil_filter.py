@@ -22,14 +22,9 @@ def _next_workload_id(kernel_name: str = "boxblur") -> str:
     return f"{prefix}-{kernel_name}-demo-{count:03d}"
 
 def get_swarm_client(socket_path: str = "/tmp/swarmx.sock") -> SwarmClient:
-    global _GLOBAL_CLIENT
+    from swarmx.client import get_thread_local_client
     env_sock = os.environ.get("SWARMX_IPC_PATH", socket_path)
-    if _GLOBAL_CLIENT is None:
-        _GLOBAL_CLIENT = SwarmClient(socket_path=env_sock, timeout=30.0)
-    elif _GLOBAL_CLIENT.socket_path != env_sock:
-        _GLOBAL_CLIENT.close()
-        _GLOBAL_CLIENT = SwarmClient(socket_path=env_sock, timeout=30.0)
-    return _GLOBAL_CLIENT
+    return get_thread_local_client(socket_path=env_sock, timeout=30.0)
 
 def is_certified_box_blur(filter_spec) -> bool:
     """Only certified ImageFilter.BoxBlur operations with a valid radius are eligible."""

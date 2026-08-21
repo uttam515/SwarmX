@@ -188,8 +188,10 @@ export class ScoredScheduler implements IScheduler {
       const nominalThroughput = (worker.capabilityProfile.cpuCores * 100) + (worker.capabilityProfile.hasGpu ? 500 : 0);
       const throughputScore = Math.min(1.0, (observedThroughput ?? nominalThroughput) / 2000);
 
-      // 2. Capacity Headroom Score [0.0 - 1.0]: based on CPU utilization and available RAM
-      const cpuHeadroom = 1.0 - (worker.latestTelemetry?.cpuUtilization ?? 0.3);
+      // 2. Capacity Headroom Score [0.0 - 1.0]: based on CPU utilization, available RAM, and in-flight tasks
+      const inFlightCount = taskStore ? taskStore.getActiveTaskCountForWorker(worker.deviceId) : 0;
+      const inFlightLoad = Math.min(0.8, inFlightCount * 0.20);
+      const cpuHeadroom = Math.max(0.05, 1.0 - (worker.latestTelemetry?.cpuUtilization ?? 0.3) - inFlightLoad);
       const ramHeadroom = Math.min(1.0, (worker.latestTelemetry?.availableRamMb ?? 4096) / worker.capabilityProfile.totalRamMb);
       const capacityScore = Math.max(0.0, Math.min(1.0, (0.5 * cpuHeadroom) + (0.5 * ramHeadroom)));
 

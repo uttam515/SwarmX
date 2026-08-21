@@ -168,3 +168,117 @@ export class ToleranceAwareImageValidator implements IResultValidator {
     };
   }
 }
+
+/**
+ * Cross-Hardware Tolerance-Aware Matrix / Float32 Validator:
+ * Validates binary Float32 buffers against dimensions and numerical tolerance:
+ * - Validates exact byte size matching M x N x 4
+ * - Verifies all values are finite (no NaN or Inf)
+ * - Validates relative and absolute error against reference if provided: |actual - expected| <= atol + rtol * |expected|
+ */
+export class ToleranceAwareMatrixValidator implements IResultValidator {
+  private referenceBytes?: Buffer | Uint8Array;
+  private atol: number;
+  private rtol: number;
+
+  constructor(
+    referenceBytes?: Buffer | Uint8Array,
+    atol: number = 1e-4,
+    rtol: number = 1e-4
+  ) {
+    this.referenceBytes = referenceBytes;
+    this.atol = atol;
+    this.rtol = rtol;
+  }
+
+  public validate(task: Task, resultData: Buffer | string): ValidationResult {
+    const actualBytes: Buffer = Buffer.isBuffer(resultData)
+      ? resultData
+      : Buffer.from(resultData, 'base64');
+
+    if (actualBytes.length % 4 !== 0) {
+      return {
+        isValid: false,
+        reason: `Invalid Float32 buffer size: ${actualBytes.length} is not a multiple of 4 bytes`
+      };
+    }
+
+    let params: { M?: number; N?: number; K?: number } = {};
+    try {
+      const desc = JSON.parse(task.computationDescriptor);
+      if (desc.parameters) params = desc.parameters;
+    } catch (e) {}
+
+    const { M, N } = params;
+    if (M && N) {
+      const expectedLen = M * N * 4;
+      if (actualBytes.length !== expectedLen) {
+        return {
+          isValid: false,
+          reason: `Matrix buffer size mismatch: expected ${expectedLen} bytes for ${M}x${N} float32, got ${actualBytes.length} bytes`,
+          details: { expectedBytes: expectedLen, actualBytes: actualBytes.length }
+        };
+      }
+    }
+
+    const floatCount = actualBytes.length / 4;
+    const floatView = actualBytes.byteOffset % 4 === 0
+      ? new Float32Array(actualBytes.buffer, actualBytes.byteOffset, floatCount)
+      : new Float32Array(actualBytes.buffer.slice(actualBytes.byteOffset, actualBytes.byteOffset + floatCount * 4));
+
+    // 1. Check finite values
+    for (let i = 0; i < floatView.length; i++) {
+      if (!Number.isFinite(floatView[i])) {
+        return {
+          isValid: false,
+          reason: `Non-finite float value (NaN/Infinity) encountered at index ${i}`
+        };
+      }
+    }
+
+    // 2. Tolerance comparison against reference
+    if (this.referenceBytes) {
+      const refCount = this.referenceBytes.length / 4;
+      if (floatCount !== refCount) {
+        return {
+          isValid: false,
+          reason: `Element count mismatch: expected ${refCount}, got ${floatCount}`
+        };
+      }
+
+      const refView = new Float32Array(
+        this.referenceBytes.buffer,
+        this.referenceBytes.byteOffset,
+        refCount
+      );
+
+      let maxDiff = 0;
+      let sumSquaredError = 0;
+      for (let i = 0; i < floatCount; i++) {
+        const diff = Math.abs(floatView[i] - refView[i]);
+        const tol = this.atol + this.rtol * Math.abs(refView[i]);
+        if (diff > maxDiff) maxDiff = diff;
+        sumSquaredError += diff * diff;
+
+        if (diff > tol) {
+          return {
+            isValid: false,
+            reason: `Matrix numerical tolerance exceeded at index ${i}: |${floatView[i]} - ${refView[i]}| = ${diff} > ${tol}`,
+            details: { index: i, actual: floatView[i], expected: refView[i], diff, tolerance: tol }
+          };
+        }
+      }
+
+      const mse = sumSquaredError / floatCount;
+      return {
+        isValid: true,
+        details: { maxAbsoluteError: maxDiff, mse, elementCount: floatCount }
+      };
+    }
+
+    return {
+      isValid: true,
+      details: { elementCount: floatCount, finiteCheck: true, shape: M && N ? `${M}x${N}` : 'N/A' }
+    };
+  }
+}

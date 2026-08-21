@@ -346,6 +346,91 @@ final class SwarmXWorkerTests: XCTestCase {
         XCTAssertEqual(resultFloats[2], 43.0, accuracy: 0.001)
         XCTAssertEqual(resultFloats[3], 50.0, accuracy: 0.001)
     }
+
+    func testNonSquareMatrixMultiply() {
+        // Non-square M x K x N: M=2, K=3, N=2
+        // A = [[1, 2, 3], [4, 5, 6]] (2x3)
+        // B = [[7, 8], [9, 1], [2, 3]] (3x2)
+        // C = A * B:
+        // C[0,0] = 1*7 + 2*9 + 3*2 = 7 + 18 + 6 = 31
+        // C[0,1] = 1*8 + 2*1 + 3*3 = 8 + 2 + 9 = 19
+        // C[1,0] = 4*7 + 5*9 + 6*2 = 28 + 45 + 12 = 85
+        // C[1,1] = 4*8 + 5*1 + 6*3 = 32 + 5 + 18 = 55
+        let a: [Float] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+        let b: [Float] = [7.0, 8.0, 9.0, 1.0, 2.0, 3.0]
+        var inFloats = a + b
+        let inData = Data(bytes: &inFloats, count: inFloats.count * 4)
+
+        let payload = TaskPayload(
+            taskId: "t-nonsquare-01",
+            attemptNumber: 1,
+            computationDescriptor: "{\"kernelId\":\"matrix_multiply_v1\",\"parameters\":{\"M\":2,\"K\":3,\"N\":2}}",
+            inputRef: "ref",
+            inputData: inData.base64EncodedString(),
+            itemCount: 1
+        )
+
+        let res = ImageProcessingKernel.shared.processTask(payload: payload)
+        XCTAssertEqual(res.status, "COMPLETED")
+        guard let outData = Data(base64Encoded: res.outputData) else {
+            XCTFail("Failed to decode output")
+            return
+        }
+
+        XCTAssertEqual(outData.count, 2 * 2 * 4)
+        var c = [Float](repeating: 0, count: 4)
+        outData.withUnsafeBytes { ptr in
+            let fPtr = ptr.bindMemory(to: Float.self)
+            for i in 0..<4 { c[i] = fPtr[i] }
+        }
+
+        XCTAssertEqual(c[0], 31.0, accuracy: 1e-4)
+        XCTAssertEqual(c[1], 19.0, accuracy: 1e-4)
+        XCTAssertEqual(c[2], 85.0, accuracy: 1e-4)
+        XCTAssertEqual(c[3], 55.0, accuracy: 1e-4)
+    }
+
+    func testNativeMatrixMultiplyBenchmarkCalibration() {
+        let dimensions = [64, 128, 256, 512]
+        for n in dimensions {
+            let totalElements = n * n
+            let a = [Float](repeating: 1.0, count: totalElements)
+            let b = [Float](repeating: 2.0, count: totalElements)
+            var inFloats = a + b
+            let inData = Data(bytes: &inFloats, count: inFloats.count * 4)
+
+            let payload = TaskPayload(
+                taskId: "t-bench-\(n)",
+                attemptNumber: 1,
+                computationDescriptor: "{\"kernelId\":\"matrix_multiply_v1\",\"parameters\":{\"M\":\(n),\"K\":\(n),\"N\":\(n)}}",
+                inputRef: "ref",
+                inputData: inData.base64EncodedString(),
+                itemCount: 1
+            )
+
+            let start = DispatchTime.now()
+            let res = ImageProcessingKernel.shared.processTask(payload: payload)
+            let elapsedNs = DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds
+            let elapsedMs = Double(elapsedNs) / 1_000_000.0
+
+            XCTAssertEqual(res.status, "COMPLETED")
+            guard let outData = Data(base64Encoded: res.outputData) else {
+                XCTFail("Failed to decode output")
+                return
+            }
+
+            let gflops = (2.0 * Double(n * n * n)) / (elapsedMs * 1e6)
+            print("🚀 [Accelerate cblas_sgemm Benchmark] \(n)x\(n)x\(n) GEMM: \(String(format: "%.2f", elapsedMs))ms (\(String(format: "%.2f", gflops)) GFLOPs/s)")
+
+            // Verify analytical value: each element should be 1.0 * 2.0 * n = 2.0 * n
+            let expectedVal = Float(2.0 * Double(n))
+            outData.withUnsafeBytes { ptr in
+                let fPtr = ptr.bindMemory(to: Float.self)
+                XCTAssertEqual(fPtr[0], expectedVal, accuracy: 1e-3)
+                XCTAssertEqual(fPtr[totalElements - 1], expectedVal, accuracy: 1e-3)
+            }
+        }
+    }
 }
 
 private extension Data {

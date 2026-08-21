@@ -19,10 +19,9 @@ export interface DecodedBinaryFrame {
  */
 export function encodeBinaryFrame(metadata: any, payload: Buffer): Buffer {
   if (metadata && typeof metadata === 'object') {
+    metadata.totalPayloadBytes = payload.length;
     if (metadata.result && typeof metadata.result === 'object') {
       metadata.result.totalPayloadBytes = payload.length;
-    } else {
-      metadata.totalPayloadBytes = payload.length;
     }
   }
 

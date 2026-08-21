@@ -534,10 +534,16 @@ export class TaskStore {
     })();
   }
 
+  public getActiveTaskCountForWorker(workerId: string): number {
+    const stmt = this.db.prepare(
+      "SELECT COUNT(*) as count FROM tasks WHERE assigned_worker_id = ? AND status IN ('ASSIGNED', 'RUNNING')"
+    );
+    const row = stmt.get(workerId) as any;
+    return row ? row.count : 0;
+  }
+
   /**
    * Returns the list of worker IDs that have previously failed validation or execution for this task.
-   * Derived dynamically from attempt_history to prevent redundant database state while ensuring
-   * durable, auditable worker exclusions.
    */
   public getExcludedWorkerIds(taskId: string): string[] {
     const task = this.getTask(taskId);

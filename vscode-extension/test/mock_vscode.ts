@@ -48,6 +48,15 @@ const mockVscode = {
       show: () => {},
       hide: () => {}
     }),
+    createOutputChannel: (name: string) => ({
+      name,
+      append: () => {},
+      appendLine: () => {},
+      clear: () => {},
+      show: () => {},
+      hide: () => {},
+      dispose: () => {}
+    }),
     showInformationMessage: async () => 'OK',
     showWarningMessage: async () => 'OK',
     showErrorMessage: async () => 'OK',

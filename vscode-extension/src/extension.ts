@@ -2,11 +2,13 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import { CoreIpcClient } from './core_ipc_client';
 import { EnvironmentManager } from './environment_manager';
+import { ProcessManager } from './process_manager';
 import { DashboardViewProvider } from './views/dashboard_view_provider';
 import { WorkersTreeProvider, DiscoveredTreeProvider, TasksTreeProvider, WorkerTreeItem } from './views/worker_tree_provider';
 
 let ipcClient: CoreIpcClient;
 let envManager: EnvironmentManager;
+let processManager: ProcessManager;
 let dashboardProvider: DashboardViewProvider;
 let statusBarItem: vscode.StatusBarItem;
 let refreshInterval: NodeJS.Timeout | null = null;
@@ -14,19 +16,24 @@ let refreshInterval: NodeJS.Timeout | null = null;
 export async function activate(context: vscode.ExtensionContext) {
   console.log('🐝 SwarmX Distributed Runtime extension activating...');
 
-  // 1. Initialize IPC Client and Environment Manager
+  const workspaceRoot = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0
+    ? vscode.workspace.workspaceFolders[0].uri.fsPath
+    : context.extensionPath;
+
+  // 1. Initialize IPC Client, Environment Manager, and Process Manager
   ipcClient = new CoreIpcClient('/tmp/swarmx.sock');
   envManager = new EnvironmentManager(context);
+  processManager = new ProcessManager(workspaceRoot, ipcClient);
 
   // 2. Register Dashboard Webview Provider
-  dashboardProvider = new DashboardViewProvider(context.extensionUri, ipcClient, envManager);
+  dashboardProvider = new DashboardViewProvider(context.extensionUri, ipcClient, envManager, processManager);
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(DashboardViewProvider.viewType, dashboardProvider, {
       webviewOptions: { retainContextWhenHidden: true }
     })
   );
 
-  // 3. Register Tree Data Providers (Preserving companion views)
+  // 3. Register Tree Data Providers
   const workersProvider = new WorkersTreeProvider(ipcClient);
   const discoveredProvider = new DiscoveredTreeProvider(ipcClient);
   const tasksProvider = new TasksTreeProvider(ipcClient);
@@ -43,7 +50,7 @@ export async function activate(context: vscode.ExtensionContext) {
   async function updateStatusBar() {
     if (!ipcClient.connected) {
       statusBarItem.text = '$(circle-slash) SwarmX: Core Offline';
-      statusBarItem.tooltip = 'SwarmX Core daemon not connected (/tmp/swarmx.sock). Click to reconnect.';
+      statusBarItem.tooltip = 'SwarmX Core daemon offline. Click to start or reconnect.';
       statusBarItem.show();
       return;
     }
@@ -81,6 +88,7 @@ export async function activate(context: vscode.ExtensionContext) {
     await updateStatusBar();
   }
 
+  // Initial connection probe
   await tryConnect();
 
   // 5. Periodic Polling (every 2 seconds)
@@ -97,7 +105,72 @@ export async function activate(context: vscode.ExtensionContext) {
     await updateStatusBar();
   }, 2000);
 
-  // 6. Register Commands
+  // 6. Register Lifecycle Commands
+  context.subscriptions.push(
+    vscode.commands.registerCommand('swarmx.startCore', async () => {
+      vscode.window.showInformationMessage('🐝 Starting SwarmX Core Daemon...');
+      const ok = await processManager.startCore();
+      if (ok) {
+        await tryConnect();
+        vscode.window.showInformationMessage('✨ SwarmX Core is ONLINE.');
+      } else {
+        vscode.window.showErrorMessage('❌ Failed to start SwarmX Core. Check Output channel for details.');
+      }
+      await dashboardProvider.update();
+      await updateStatusBar();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('swarmx.stopCore', async () => {
+      await processManager.stopCore();
+      await tryConnect();
+      vscode.window.showInformationMessage('🛑 SwarmX Core stopped.');
+      await dashboardProvider.update();
+      await updateStatusBar();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('swarmx.restartCore', async () => {
+      vscode.window.showInformationMessage('🔄 Restarting SwarmX Core...');
+      await processManager.restartCore();
+      await tryConnect();
+      vscode.window.showInformationMessage('✨ SwarmX Core restarted.');
+      await dashboardProvider.update();
+      await updateStatusBar();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('swarmx.startLocalWorker', async () => {
+      vscode.window.showInformationMessage('🍏 Starting local SwarmX Worker...');
+      const ok = await processManager.startWorker();
+      if (ok) {
+        vscode.window.showInformationMessage('🍏 SwarmX Local Worker process spawned.');
+      } else {
+        vscode.window.showErrorMessage('❌ Failed to start local worker.');
+      }
+      await dashboardProvider.update();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('swarmx.stopLocalWorker', async () => {
+      await processManager.stopWorker();
+      vscode.window.showInformationMessage('🛑 Local SwarmX Worker stopped.');
+      await dashboardProvider.update();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('swarmx.restartLocalWorker', async () => {
+      await processManager.restartWorker();
+      vscode.window.showInformationMessage('🔄 Local SwarmX Worker restarted.');
+      await dashboardProvider.update();
+    })
+  );
+
   context.subscriptions.push(
     vscode.commands.registerCommand('swarmx.refresh', async () => {
       if (!ipcClient.connected) {
@@ -264,6 +337,9 @@ export async function activate(context: vscode.ExtensionContext) {
 export function deactivate() {
   if (refreshInterval) {
     clearInterval(refreshInterval);
+  }
+  if (processManager) {
+    processManager.dispose(); // Only terminates extension-owned processes
   }
   if (ipcClient) {
     ipcClient.disconnect();
