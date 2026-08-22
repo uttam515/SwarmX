@@ -364,15 +364,22 @@ public class SwarmClient {
             if let envDict = json["envelope"] as? [String: Any],
                let envData = try? JSONSerialization.data(withJSONObject: envDict) {
                 print("[WORKER] EXECUTE_TASK received (envelope bytes: \(envData.count))")
+                let taskId = (json["taskId"] as? String) ?? "unknown-task"
+                self.sendTaskStage(taskId: taskId, stage: "DECRYPTING")
+                
                 if let envelope = try? JSONDecoder().decode(EncryptedEnvelope.self, from: envData),
                    let decryptedData = try? PairingManager.shared.decryptEnvelope(envelope: envelope),
                    let taskPayload = try? JSONDecoder().decode(TaskPayload.self, from: decryptedData) {
                     
                     print("[WORKER] Payload decrypted and decoded")
+                    self.sendTaskStage(taskId: taskPayload.taskId, stage: "EXECUTING")
+                    
                     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                         guard let self = self else { return }
                         let resultPayload = ImageProcessingKernel.shared.processTask(payload: taskPayload)
                         guard let resultData = try? JSONEncoder().encode(resultPayload) else { return }
+                        
+                        self.sendTaskStage(taskId: taskPayload.taskId, stage: "TRANSMITTING")
                         
                         // Strictly serialize encryption and wire transmission on the dedicated network queue
                         self.queue.async {
@@ -397,6 +404,7 @@ public class SwarmClient {
                     }
                 } else {
                     print("⚠️ [WORKER] Failed to decrypt or decode EXECUTE_TASK envelope")
+                    self.sendTaskStage(taskId: taskId, stage: "FAILED")
                 }
             }
 
@@ -441,6 +449,22 @@ public class SwarmClient {
                 "deviceId": self.deviceId,
                 "envelope": envDict
             ]
+            self.send(json: msg)
+        }
+    }
+
+    public func sendTaskStage(taskId: String, stage: String, details: [String: Any]? = nil) {
+        self.queue.async { [weak self] in
+            guard let self = self else { return }
+            var msg: [String: Any] = [
+                "type": "TASK_STAGE",
+                "workerDeviceId": self.deviceId,
+                "taskId": taskId,
+                "stage": stage
+            ]
+            if let details = details {
+                msg["details"] = details
+            }
             self.send(json: msg)
         }
     }

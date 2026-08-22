@@ -195,8 +195,8 @@ export class ScoredScheduler implements IScheduler {
 
       // 2. Capacity Headroom Score [0.0 - 1.0]: based on CPU utilization, available RAM, and in-flight tasks
       const inFlightCount = taskStore ? taskStore.getActiveTaskCountForWorker(worker.deviceId) : 0;
-      const inFlightLoad = Math.min(0.8, inFlightCount * 0.20);
-      const cpuHeadroom = Math.max(0.05, 1.0 - (worker.latestTelemetry?.cpuUtilization ?? 0.3) - inFlightLoad);
+      const inFlightLoad = Math.min(0.9, inFlightCount * 0.45);
+      const cpuHeadroom = Math.max(0.01, 1.0 - (worker.latestTelemetry?.cpuUtilization ?? 0.3) - inFlightLoad);
       const ramHeadroom = Math.min(1.0, (worker.latestTelemetry?.availableRamMb ?? 4096) / worker.capabilityProfile.totalRamMb);
       const capacityScore = Math.max(0.0, Math.min(1.0, (0.5 * cpuHeadroom) + (0.5 * ramHeadroom)));
 
@@ -207,11 +207,15 @@ export class ScoredScheduler implements IScheduler {
       const failureCount = this.workerFailureCounts.get(worker.deviceId) || 0;
       const instabilityPenalty = Math.min(1.0, failureCount * 0.30);
 
-      // Final deterministic formula: w1*throughput + w2*capacity - w3*transfer - w4*instability
+      // 5. In-Flight Active Task Penalty: heavily penalizes workers currently executing tasks (favors idle workers)
+      const inFlightPenalty = inFlightCount * 0.50;
+
+      // Final deterministic formula: w1*throughput + w2*capacity - w3*transfer - w4*instability - inFlightPenalty
       const finalScore = Math.max(0.0, (this.weights.w1_throughput * throughputScore) +
                          (this.weights.w2_capacity * capacityScore) -
                          (this.weights.w3_transferCost * transferCostScore) -
-                         (this.weights.w4_instability * instabilityPenalty));
+                         (this.weights.w4_instability * instabilityPenalty) -
+                         inFlightPenalty);
 
       candidateScores.push({
         workerId: worker.deviceId,

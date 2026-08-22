@@ -155,6 +155,7 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
     let connectedWorkers: any[] = [];
     let discoveredWorkers: any[] = [];
     let recentWorkloads: any[] = [];
+    let liveWorkers: any[] = [];
     let isConnected = false;
 
     try {
@@ -164,6 +165,7 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
         connectedWorkers = await this.ipcClient.request<any[]>('listWorkers').catch(() => []);
         discoveredWorkers = await this.ipcClient.request<any[]>('listDiscoveredWorkers').catch(() => []);
         recentWorkloads = await this.ipcClient.request<any[]>('listRecentWorkloads').catch(() => []);
+        liveWorkers = await this.ipcClient.request<any[]>('getLiveWorkers').catch(() => []);
       }
     } catch (e) {
       isConnected = false;
@@ -185,6 +187,7 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
       connectedWorkers,
       discoveredWorkers,
       recentWorkloads,
+      liveWorkers,
       recentLogs,
       envActive: this.envManager.active,
       forceSwarmDemo: this.envManager.forceSwarmDemo,
@@ -347,22 +350,69 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
       `;
     }
 
-    // Dynamic Connected workers HTML (N-Worker support)
+    const liveMap = new Map<string, any>();
+    for (const lw of (state.liveWorkers || [])) {
+      if (lw.deviceId) liveMap.set(lw.deviceId, lw);
+    }
+
+    // Dynamic Connected workers HTML (Authoritative Per-Worker Live State Cards)
     let workersListHtml = '';
     if (realConnected.length > 0) {
-      workersListHtml = realConnected.map((w: any) => `
-        <div class="worker-card">
+      workersListHtml = realConnected.map((w: any) => {
+        const live = liveMap.get(w.deviceId) || w.liveState || {};
+        const stage = live.stage || (w.isEligible ? 'READY' : 'OFFLINE');
+        let stageBadge = `<span class="badge ready">● ${stage}</span>`;
+        if (stage === 'EXECUTING') {
+          stageBadge = '<span class="badge active-exec">⚡ EXECUTING</span>';
+        } else if (stage === 'FETCHING' || stage === 'DECRYPTING' || stage === 'DECODING') {
+          stageBadge = `<span class="badge fetching">⟳ ${stage}</span>`;
+        } else if (stage === 'TRANSMITTING') {
+          stageBadge = '<span class="badge transmitting">↑ TRANSMITTING</span>';
+        } else if (stage === 'FAILED') {
+          stageBadge = '<span class="badge offline">✗ FAILED</span>';
+        } else if (stage === 'RETRYING') {
+          stageBadge = '<span class="badge demo">⟳ RETRYING</span>';
+        }
+
+        const chunkInfo = live.currentTaskId
+          ? `<div class="live-task-info">
+              <span class="chunk-badge">Current Chunk: ${(live.currentChunkIndex !== undefined ? live.currentChunkIndex + 1 : 1)} / ${live.totalChunks || totalChunks}</span>
+              ${live.frameCount ? `<span class="frames-badge">Frames ${live.startFrameIndex || 0}–${(live.startFrameIndex || 0) + live.frameCount - 1}</span>` : ''}
+             </div>`
+          : '<div class="live-task-info idle"><span>Current Chunk: NONE (Waiting for queued task)</span></div>';
+
+        const stages = live.pipelineStages || {};
+        const pipelineHtml = `
+          <div class="pipeline-checklist">
+            <span class="step-pill ${stages.fetching ? 'completed' : ''}">✓ FETCH</span>
+            <span class="step-pill ${stages.decrypting ? 'completed' : ''}">✓ DECRYPT</span>
+            <span class="step-pill ${stages.decoding ? 'completed' : ''}">✓ DECODE</span>
+            <span class="step-pill ${stage === 'EXECUTING' ? 'active-pulse' : (stages.executing ? 'completed' : '')}">→ EXEC</span>
+            <span class="step-pill ${stages.transmitting ? 'completed' : ''}">○ TX</span>
+          </div>
+        `;
+
+        return `
+        <div class="worker-card ${stage === 'EXECUTING' ? 'busy-card' : ''}">
           <div class="worker-header">
             <span class="worker-name">🍏 ${this.escapeHtml(w.capabilityProfile?.deviceName || w.deviceId)}</span>
-            <span class="badge ready">${w.isEligible ? '● READY' : 'OFFLINE'}</span>
+            ${stageBadge}
           </div>
           <div class="worker-specs">
             <span class="spec-tag">${w.capabilityProfile?.cpuCores || 8} Cores</span>
             <span class="spec-tag">${((w.capabilityProfile?.totalRamMb || 16384) / 1024).toFixed(0)} GB RAM</span>
             <span class="spec-tag gpu">${w.capabilityProfile?.gpuModel || 'Apple Silicon GPU'}</span>
           </div>
+          ${chunkInfo}
+          ${pipelineHtml}
+          <div class="worker-footer">
+            <span>Completed: <b>${live.completedChunks || 0}</b></span>
+            <span>Exec: <b>${live.executionTimeMs ? live.executionTimeMs + 'ms' : '—'}</b></span>
+            <span>Heartbeat: <b style="color: #10b981;">HEALTHY</b></span>
+          </div>
         </div>
-      `).join('');
+      `;
+      }).join('');
     }
     if (isSimulated) {
       workersListHtml += `
@@ -512,6 +562,22 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
             color: #10b981;
             border: 1px solid rgba(16, 185, 129, 0.3);
           }
+          .badge.active-exec {
+            background: rgba(239, 68, 68, 0.2);
+            color: #f87171;
+            border: 1px solid rgba(239, 68, 68, 0.4);
+            animation: pulse-border 1s infinite alternate;
+          }
+          .badge.fetching {
+            background: rgba(59, 130, 246, 0.15);
+            color: #60a5fa;
+            border: 1px solid rgba(59, 130, 246, 0.3);
+          }
+          .badge.transmitting {
+            background: rgba(147, 51, 234, 0.15);
+            color: #c084fc;
+            border: 1px solid rgba(147, 51, 234, 0.3);
+          }
           .badge.offline {
             background: rgba(107, 114, 128, 0.15);
             color: #9ca3af;
@@ -526,6 +592,66 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
             background: rgba(168, 85, 247, 0.15);
             color: #c084fc;
             border: 1px solid rgba(168, 85, 247, 0.3);
+          }
+          @keyframes pulse-border {
+            from { border-color: rgba(239, 68, 68, 0.4); }
+            to { border-color: rgba(239, 68, 68, 0.9); }
+          }
+          .live-task-info {
+            margin: 5px 0 3px 0;
+            font-size: 9.5px;
+            color: #eee;
+            display: flex;
+            gap: 6px;
+          }
+          .live-task-info.idle {
+            color: #777;
+            font-style: italic;
+          }
+          .chunk-badge {
+            background: rgba(255, 255, 255, 0.08);
+            padding: 1px 4px;
+            border-radius: 3px;
+            font-weight: 600;
+          }
+          .frames-badge {
+            color: #10b981;
+            font-weight: 500;
+          }
+          .pipeline-checklist {
+            display: flex;
+            gap: 4px;
+            margin: 4px 0;
+            flex-wrap: wrap;
+          }
+          .step-pill {
+            font-size: 8.5px;
+            font-family: monospace;
+            padding: 1px 4px;
+            border-radius: 3px;
+            background: rgba(255, 255, 255, 0.03);
+            color: #555;
+            border: 1px solid rgba(255, 255, 255, 0.05);
+          }
+          .step-pill.completed {
+            background: rgba(16, 185, 129, 0.1);
+            color: #10b981;
+            border-color: rgba(16, 185, 129, 0.3);
+          }
+          .step-pill.active-pulse {
+            background: rgba(239, 68, 68, 0.15);
+            color: #f87171;
+            border-color: rgba(239, 68, 68, 0.5);
+            font-weight: 700;
+          }
+          .worker-footer {
+            display: flex;
+            justify-content: space-between;
+            font-size: 9px;
+            color: #888;
+            margin-top: 4px;
+            padding-top: 4px;
+            border-top: 1px solid rgba(255, 255, 255, 0.04);
           }
           .btn {
             background: var(--accent);
@@ -956,6 +1082,13 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
               sendAction('toggleSection', { section: sec, open: d.open });
             });
           });
+
+          // Dynamic real-time auto-refresh polling (350ms while active, 1500ms when idle)
+          const isBusy = document.querySelector('.busy-card') !== null || document.querySelector('.badge.active-exec') !== null || document.querySelector('.badge.fetching') !== null;
+          const pollRate = isBusy ? 350 : 1500;
+          setTimeout(() => {
+            sendAction('refresh');
+          }, pollRate);
         </script>
       </body>
     </html>`;

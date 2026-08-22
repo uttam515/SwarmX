@@ -43,11 +43,17 @@ class SwarmClient:
             return False
         try:
             self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            self.sock.settimeout(self.timeout)
+            self.sock.settimeout(min(1.0, self.timeout))
             self.sock.connect(self.socket_path)
+            self.sock.settimeout(self.timeout)
             self._recv_buffer = ""
             return True
         except Exception:
+            if self.sock is not None:
+                try:
+                    self.sock.close()
+                except Exception:
+                    pass
             self.sock = None
             return False
 

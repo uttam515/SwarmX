@@ -4,7 +4,7 @@ import { Bonjour } from 'bonjour-service';
 import { PairingService } from './pairing_service';
 import { WorkerManager } from './worker_manager';
 import { TaskStore } from './db/task_store';
-import { DiscoveredWorker, EncryptedEnvelope, Task } from './types';
+import { DiscoveredWorker, EncryptedEnvelope, Task, WorkerExecutionStage } from './types';
 import { WorkloadPipeline } from './workload_pipeline';
 import { Logger } from './logger';
 
@@ -191,6 +191,9 @@ export class TransportServer {
 
     const envelope = this.pairingService.encryptEnvelope(workerDeviceId, taskPayload);
     Logger.transport(`EXECUTE_TASK sent: ${task.id} -> ${workerDeviceId}`);
+    this.workerManager.updateWorkerStage(workerDeviceId, WorkerExecutionStage.FETCHING, {
+      currentTaskId: task.id
+    });
     ws.send(JSON.stringify({
       type: 'EXECUTE_TASK',
       taskId: task.id,
@@ -378,19 +381,39 @@ export class TransportServer {
         };
       }
 
+      case 'TASK_STAGE': {
+        const workerId = msg.workerDeviceId || (ws as any)._workerDeviceId;
+        if (workerId && msg.stage) {
+          this.workerManager.updateWorkerStage(workerId, msg.stage as WorkerExecutionStage, msg.details);
+        }
+        return { type: 'TASK_STAGE_ACK', taskId: msg.taskId };
+      }
+
       case 'TASK_RESULT': {
         const decryptedBytes = this.pairingService.decryptEnvelope(msg.envelope);
         const resultPayload = JSON.parse(decryptedBytes.toString('utf-8'));
         const workerHost = resultPayload.workerHostname || msg.workerDeviceId;
         const workerPidStr = resultPayload.workerPid ? ` (PID=${resultPayload.workerPid})` : '';
+        const targetWorkerId = msg.workerDeviceId || (ws as any)._workerDeviceId;
+
         Logger.transport(`TASK_RESULT received: ${resultPayload.taskId || msg.taskId} from ${workerHost}`);
         Logger.execution(`Result received for task ${resultPayload.taskId || msg.taskId} from ${workerHost}${workerPidStr} in ${resultPayload.executionTimeMs || 0}ms`);
         
+        if (targetWorkerId) {
+          this.workerManager.updateWorkerStage(targetWorkerId, WorkerExecutionStage.COMPLETED, {
+            lastCompletedTaskId: resultPayload.taskId || msg.taskId,
+            executionTimeMs: resultPayload.executionTimeMs
+          });
+          setImmediate(() => {
+            this.workerManager.updateWorkerStage(targetWorkerId, WorkerExecutionStage.READY);
+          });
+        }
+
         let processingResult = null;
         if (this.workloadPipeline) {
           processingResult = await this.workloadPipeline.handleTaskResult({
             taskId: resultPayload.taskId || msg.taskId,
-            workerId: msg.workerDeviceId || (ws as any)._workerDeviceId,
+            workerId: targetWorkerId,
             outputData: resultPayload.outputData,
             executionTimeMs: resultPayload.executionTimeMs || 0,
             attemptNumber: resultPayload.attemptNumber,

@@ -11,7 +11,7 @@ import { ScoredScheduler } from './scheduler';
 import { DistributionDecisionEngine } from './decision_engine';
 import { KernelRegistry } from './kernel_registry';
 import { BINARY_FRAME_MAGIC, encodeBinaryFrame, decodeBinaryFrame } from './binary_framing';
-import { Task, TaskStatus, WorkloadDescriptor } from './types';
+import { Task, TaskStatus, WorkloadDescriptor, WorkerExecutionStage } from './types';
 import { Logger } from './logger';
 import { SimulationWorkerAdapter } from './simulation_worker';
 import { MatrixChunkEngine, MatrixChunkSpec, MatrixChunkResult, ImageChunkEngine, ImageChunkSpec, ImageChunkResult, VideoChunkEngine, VideoChunkSpec, VideoChunkResult } from './chunk_engine';
@@ -330,6 +330,7 @@ export class IpcServer {
           const discovered = this.transportServer.getDiscoveredWorkers();
           const trusted = this.pairingService.listTrustedWorkers();
           const socketCount = this.transportServer.getConnectedSocketCount();
+          const liveWorkers = this.workerManager.listLiveStates();
 
           return {
             id: msg.id,
@@ -345,7 +346,9 @@ export class IpcServer {
               connectedWorkers: workers.length,
               discoveredWorkerCount: discovered.length,
               trustedWorkerCount: trusted.length,
-              webSocketConnectionCount: socketCount
+              webSocketConnectionCount: socketCount,
+              workers,
+              liveWorkers
             }
           };
         }
@@ -359,6 +362,12 @@ export class IpcServer {
         case 'listConnectedWorkers': {
           const workers = this.workerManager.listWorkers();
           return { id: msg.id, result: workers };
+        }
+
+        case 'getLiveWorkers':
+        case 'listLiveStates': {
+          const liveWorkers = this.workerManager.listLiveStates();
+          return { id: msg.id, result: liveWorkers };
         }
 
         case 'listTrustedWorkers': {
@@ -1631,7 +1640,7 @@ export class IpcServer {
       const t_sched_start = performance.now();
       const chunkResults: VideoChunkResult[] = [];
       const pendingSpecs = [...chunkSpecs];
-      const concurrency = Math.max(1, effectiveWorkerCount * 2); // Dynamic work queue with pipeline overlap
+      const concurrency = Math.max(1, effectiveWorkerCount); // Dynamic work queue: 1 active task per physical worker
 
       // Worker dynamic consumer pool: pulls next chunk as soon as previous completes
       const workerPool = Array.from({ length: concurrency }, async () => {
@@ -1805,6 +1814,14 @@ export class IpcServer {
       this.taskStore.assignTask(chunkTaskId, targetWorkerId, dynamicChunkTimeoutMs);
       this.decisionEngine.acquireReservation(targetWorkerId);
 
+      this.workerManager.updateWorkerStage(targetWorkerId, WorkerExecutionStage.FETCHING, {
+        currentTaskId: chunkTaskId,
+        currentChunkIndex: spec.metadata.chunkIndex,
+        totalChunks: spec.metadata.totalChunks,
+        startFrameIndex: spec.metadata.startFrameIndex,
+        frameCount: spec.metadata.frameCount
+      });
+
       Logger.execution(`[PAYLOAD] Dispatching video chunk ${spec.metadata.chunkIndex + 1}/${spec.metadata.totalChunks} (${(payloadBytes / (1024 * 1024)).toFixed(2)} MB, ${spec.metadata.frameCount} frames) to ${targetWorkerId}`);
 
       try {
@@ -1833,13 +1850,20 @@ export class IpcServer {
 
         task.assignedWorkerId = targetWorkerId;
         if (targetWorkerId === SimulationWorkerAdapter.DEVICE_ID || targetWorkerId.startsWith('sim-worker-virtual-')) {
+          this.workerManager.updateWorkerStage(targetWorkerId, WorkerExecutionStage.EXECUTING);
           this.simulationWorker.executeTask(task, spec.payload, spec.metadata.frameCount)
             .then(async (simRes) => {
+              this.workerManager.updateWorkerStage(targetWorkerId, WorkerExecutionStage.TRANSMITTING);
               if (this.workloadPipeline) {
                 await this.workloadPipeline.handleTaskResult(simRes);
               }
+              this.workerManager.updateWorkerStage(targetWorkerId, WorkerExecutionStage.COMPLETED);
+              setImmediate(() => {
+                this.workerManager.updateWorkerStage(targetWorkerId, WorkerExecutionStage.READY);
+              });
             })
             .catch((err) => {
+              this.workerManager.updateWorkerStage(targetWorkerId, WorkerExecutionStage.FAILED);
               this.taskStore.recordTaskFailure(chunkTaskId, targetWorkerId!, 'SIMULATION_ERROR', { error: err.message });
             });
         } else {
@@ -1851,6 +1875,7 @@ export class IpcServer {
             spec.metadata.frameCount
           );
           if (!sent) {
+            this.workerManager.updateWorkerStage(targetWorkerId, WorkerExecutionStage.FAILED);
             this.taskStore.recordTaskFailure(chunkTaskId, targetWorkerId, 'TRANSPORT_SEND_FAILED', {});
             throw new Error(`Failed to send video chunk ${spec.metadata.chunkIndex} to worker ${targetWorkerId}`);
           }
@@ -1858,6 +1883,12 @@ export class IpcServer {
 
         const res = await completionPromise;
         if (res.status === 'COMPLETED' && res.outputData) {
+          this.workerManager.updateWorkerStage(targetWorkerId, WorkerExecutionStage.COMPLETED, {
+            executionTimeMs: res.executionTimeMs || (Date.now() - chunkStartMs)
+          });
+          setImmediate(() => {
+            this.workerManager.updateWorkerStage(targetWorkerId, WorkerExecutionStage.READY);
+          });
           return {
             parentWorkloadId,
             chunkIndex: spec.metadata.chunkIndex,
@@ -1870,6 +1901,7 @@ export class IpcServer {
           };
         } else {
           lastError = res.error || `Video chunk ${spec.metadata.chunkIndex} execution failed on ${targetWorkerId}`;
+          this.workerManager.updateWorkerStage(targetWorkerId, WorkerExecutionStage.FAILED);
           this.taskStore.recordTaskFailure(chunkTaskId, targetWorkerId, 'EXECUTION_FAILED', { error: lastError });
         }
       } finally {

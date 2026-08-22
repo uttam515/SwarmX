@@ -101,6 +101,52 @@ export interface EncryptedEnvelope {
   authTag: string; // Base64
 }
 
+export enum WorkerExecutionStage {
+  OFFLINE = 'OFFLINE',
+  STARTING = 'STARTING',
+  CONNECTING = 'CONNECTING',
+  AUTHENTICATING = 'AUTHENTICATING',
+  REGISTERING = 'REGISTERING',
+  READY = 'READY',
+  FETCHING = 'FETCHING',
+  DECRYPTING = 'DECRYPTING',
+  DECODING = 'DECODING',
+  EXECUTING = 'EXECUTING',
+  TRANSMITTING = 'TRANSMITTING',
+  COMPLETED = 'COMPLETED',
+  FAILED = 'FAILED',
+  RETRYING = 'RETRYING'
+}
+
+export interface WorkerPipelineChecklist {
+  fetching: boolean;
+  decrypting: boolean;
+  decoding: boolean;
+  executing: boolean;
+  transmitting: boolean;
+}
+
+export interface WorkerLiveState {
+  deviceId: string;
+  deviceName: string;
+  connectionState: 'CONNECTED' | 'DISCOVERED' | 'PAIRING' | 'OFFLINE';
+  stage: WorkerExecutionStage;
+  currentTaskId?: string;
+  currentChunkIndex?: number;
+  totalChunks?: number;
+  startFrameIndex?: number;
+  frameCount?: number;
+  executionTimeMs?: number;
+  stageStartTimeMs?: number;
+  completedChunks: number;
+  failedChunks: number;
+  retryCount: number;
+  pipelineStages: WorkerPipelineChecklist;
+  lastHeartbeatMs: number;
+  isEligible: boolean;
+  lastCompletedTaskId?: string;
+}
+
 export interface SwarmStatus {
   enabled: boolean;
   hostDeviceId: string;
