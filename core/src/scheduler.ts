@@ -137,13 +137,18 @@ export class ScoredScheduler implements IScheduler {
 
       if (!worker.isEligible) {
         rejectionReason = 'Worker is not marked eligible in WorkerManager';
-      } else if (worker.latestTelemetry?.thermalState !== undefined && worker.latestTelemetry.thermalState >= 2) {
+      }
+      const ignoreBattery = process.env.SWARMX_DEMO_IGNORE_BATTERY === 'true' ||
+                            process.env.SWARMX_DEMO_IGNORE_BATTERY === '1' ||
+                            process.env.SWARMX_FORCE_SWARM === '1';
+
+      if (worker.latestTelemetry?.thermalState !== undefined && worker.latestTelemetry.thermalState >= 2) {
         isEligible = false;
         rejectionReason = `Thermal state ${worker.latestTelemetry.thermalState} exceeds threshold`;
       } else if (worker.latestTelemetry?.cpuUtilization !== undefined && worker.latestTelemetry.cpuUtilization >= 0.90) {
         isEligible = false;
         rejectionReason = `CPU utilization ${(worker.latestTelemetry.cpuUtilization * 100).toFixed(0)}% exceeds 90% threshold`;
-      } else if (worker.latestTelemetry?.batteryLevel !== undefined && !worker.latestTelemetry.isCharging && worker.latestTelemetry.batteryLevel < 0.20) {
+      } else if (!ignoreBattery && worker.latestTelemetry?.batteryLevel !== undefined && !worker.latestTelemetry.isCharging && worker.latestTelemetry.batteryLevel < 0.20) {
         isEligible = false;
         rejectionReason = `Battery ${(worker.latestTelemetry.batteryLevel * 100).toFixed(0)}% below 20% limit`;
       }

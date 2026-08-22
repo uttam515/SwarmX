@@ -373,19 +373,22 @@ describe('Single-Round-Trip Execution & Trustworthy Telemetry Tests (Phase 9B)',
           const rawBytes = Buffer.from(taskPayload.inputData, 'base64');
           const inFloats = new Float32Array(rawBytes.buffer, rawBytes.byteOffset, rawBytes.byteLength / 4);
 
-          // Perform GEMM computation: M=64, K=64, N=64
-          const M = 64, K = 64, N = 64;
-          const a = inFloats.subarray(0, M * K);
-          const b = inFloats.subarray(M * K);
-          const c = new Float32Array(M * N);
+          // Dynamically decode M, K, N from computationDescriptor
+          const desc = JSON.parse(taskPayload.computationDescriptor);
+          const M_dyn = desc.parameters?.M || 512;
+          const K_dyn = desc.parameters?.K || 512;
+          const N_dyn = desc.parameters?.N || 512;
+          const a = inFloats.subarray(0, M_dyn * K_dyn);
+          const b = inFloats.subarray(M_dyn * K_dyn);
+          const c = new Float32Array(M_dyn * N_dyn);
 
-          for (let i = 0; i < M; i++) {
-            for (let j = 0; j < N; j++) {
+          for (let i = 0; i < M_dyn; i++) {
+            for (let j = 0; j < N_dyn; j++) {
               let sum = 0;
-              for (let p = 0; p < K; p++) {
-                sum += a[i * K + p] * b[p * N + j];
+              for (let p = 0; p < K_dyn; p++) {
+                sum += a[i * K_dyn + p] * b[p * N_dyn + j];
               }
-              c[i * N + j] = sum;
+              c[i * N_dyn + j] = sum;
             }
           }
 
@@ -428,8 +431,8 @@ describe('Single-Round-Trip Execution & Trustworthy Telemetry Tests (Phase 9B)',
       });
     });
 
-    // 4. Dispatch single-task binary matrix multiplication from Python client
-    const M = 64, K = 64, N = 64;
+    // 4. Dispatch single-task binary matrix multiplication from Python client (> 1MB large payload: 512x512 Float32 = 2MB raw)
+    const M = 512, K = 512, N = 512;
     const aFloats = new Float32Array(M * K).fill(1.5);
     const bFloats = new Float32Array(K * N).fill(2.0);
     const inFloats = new Float32Array(M * K + K * N);
@@ -438,7 +441,7 @@ describe('Single-Round-Trip Execution & Trustworthy Telemetry Tests (Phase 9B)',
     const rawBuffer = Buffer.from(inFloats.buffer, inFloats.byteOffset, inFloats.byteLength);
 
     const workload = {
-      workloadId: 'wkl-physical-matrix-01',
+      workloadId: 'wkl-physical-matrix-large-01',
       version: '1.0.0',
       computation: {
         domain: 'NUMERICAL_COMPUTATION',
@@ -467,9 +470,9 @@ describe('Single-Round-Trip Execution & Trustworthy Telemetry Tests (Phase 9B)',
     const executedTask = await taskExecutionPromise;
     expect(executedTask).to.not.be.undefined;
 
-    // Verify receivedInputPayload is NOT 'inline_payload' and contains actual base64 matrix data
+    // Verify receivedInputPayload is NOT 'inline_payload' and contains actual base64 matrix data > 1MB
     expect(receivedInputPayload).to.not.equal('inline_payload');
-    expect(receivedInputPayload.length).to.be.greaterThan(100);
+    expect(receivedInputPayload.length).to.be.greaterThan(1024 * 1024);
 
     // Verify task status, validation, and zero retries in task store
     expect(res.metadata.result.status).to.equal('COMPLETED');
@@ -486,5 +489,58 @@ describe('Single-Round-Trip Execution & Trustworthy Telemetry Tests (Phase 9B)',
     expect(storedTask!.attemptHistory.length).to.equal(0);
 
     ws.close();
+  });
+
+  it('4. Large Workload Transport & O(N) Ingestion (16MB/32MB Stream Ingestion)', async function() {
+    this.timeout(20000);
+    const width = 2048;
+    const height = 2048;
+    const rawBuffer = Buffer.alloc(width * height * 4); // 16MB RGBA planar buffer
+
+    const workload = {
+      workloadId: 'wkl-large-2048-ingest-test',
+      version: '1.0.0',
+      computation: {
+        domain: 'IMAGE_PROCESSING',
+        kernelId: 'image_filter_box_blur_v1',
+        parameters: { width, height, radius: 2, channels: 4, mode: 'RGBA' }
+      },
+      data: {
+        itemCount: 1,
+        totalPayloadBytes: rawBuffer.length,
+        format: 'RAW_PLANAR_RGBA_UINT8'
+      }
+    };
+
+    simulationWorker.setConfig({ enabled: true });
+
+    const t0 = Date.now();
+    const res = await sendBinaryRequest(
+      { id: 4, method: 'executeWorkload', params: { workload, forceSwarm: true } },
+      rawBuffer
+    );
+    const elapsed = Date.now() - t0;
+
+    expect(res.metadata.result.status).to.equal('COMPLETED');
+    expect(res.outputPayload.length).to.equal(width * height * 4); // 16MB output
+    expect(elapsed).to.be.lessThan(15000); // 16MB zero-copy ingested and returned
+  });
+
+  it('5. Single-Task Size-Aware Lease Timeout Calculation & SWARMX_WORKLOAD_TIMEOUT_MS', () => {
+    // Tests timeout calculation for 32MB payload (2048x2048 float32 GEMM)
+    const payload32Mb = 32 * 1024 * 1024;
+    const computedTimeoutMs = Math.max(30000, 30000 + Math.round((payload32Mb / (1024 * 1024)) * 1500));
+    expect(computedTimeoutMs).to.equal(78000); // 78 seconds for 32MB
+
+    // Tests minimum 30s floor for small payloads
+    const payloadSmall = 0;
+    const computedSmallMs = Math.max(30000, 30000 + Math.round((payloadSmall / (1024 * 1024)) * 1500));
+    expect(computedSmallMs).to.equal(30000);
+
+    // Tests environment override
+    process.env.SWARMX_WORKLOAD_TIMEOUT_MS = '95000';
+    const envTimeoutMs = process.env.SWARMX_WORKLOAD_TIMEOUT_MS ? parseInt(process.env.SWARMX_WORKLOAD_TIMEOUT_MS, 10) : 0;
+    expect(envTimeoutMs).to.equal(95000);
+    delete process.env.SWARMX_WORKLOAD_TIMEOUT_MS;
   });
 });

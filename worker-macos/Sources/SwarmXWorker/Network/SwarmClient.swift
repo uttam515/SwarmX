@@ -119,6 +119,7 @@ public class SwarmClient {
     private func initiateConnection(to endpoint: NWEndpoint) {
         let wsOptions = NWProtocolWebSocket.Options()
         wsOptions.autoReplyPing = true
+        wsOptions.maximumMessageSize = 256 * 1024 * 1024 // 256 MB symmetric headroom for high-res images and large GEMM matrices (up to 4096x4096)
 
         let parameters = NWParameters.tcp
         parameters.defaultProtocolStack.applicationProtocols.insert(wsOptions, at: 0)
@@ -133,6 +134,7 @@ public class SwarmClient {
                 self.isConnected = true
                 self.stopDiscovery()
                 print("✅ WebSocket connection established to SwarmX Host.")
+                print("[LOCAL-WORKER] WEBSOCKET_CONNECTED")
                 self.sendDiscoveryBeacon()
                 self.listen()
             case .waiting(let error):
@@ -159,17 +161,32 @@ public class SwarmClient {
         self.connection = nil
     }
 
+    private var isListening = false
+
     private func listen() {
-        guard let connection = self.connection else { return }
+        guard let connection = self.connection, self.isConnected else { return }
+        guard !self.isListening else { return }
+        self.isListening = true
+
         connection.receiveMessage { [weak self] content, context, isComplete, error in
             guard let self = self else { return }
+            self.isListening = false
+
             if let error = error {
-                print("❌ WebSocket receive error: \(error.localizedDescription)")
+                print("⚠️ [WORKER] WebSocket receive error: \(error.localizedDescription)")
+                if self.isConnected {
+                    // Reschedule receive loop on network queue to recover from transient frame error
+                    self.queue.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+                        self?.listen()
+                    }
+                }
                 return
             }
+
             if let data = content, let text = String(data: data, encoding: .utf8) {
                 self.handleMessage(text: text)
             }
+
             if self.isConnected {
                 self.listen()
             }
@@ -203,6 +220,7 @@ public class SwarmClient {
             "capabilityProfile": profileDict
         ]
         self.send(json: msg)
+        print("[LOCAL-WORKER] DISCOVERY_SENT")
     }
 
     private var isPairingInProgress = false
@@ -225,6 +243,31 @@ public class SwarmClient {
             print("🔔 [PAIRING REQUEST] Host '\(hostDeviceId)' wants to connect!")
             print("👉 VERIFY COMPARISON CODE: [ \(sasCode) ]")
             print("=======================================================")
+            print("[LOCAL-WORKER] PAIRING_REQUEST_RECEIVED")
+
+            let autoPair = ProcessInfo.processInfo.environment["SWARMX_AUTO_PAIR"] == "1"
+            if autoPair {
+                print("✅ Auto-pairing enabled (SWARMX_AUTO_PAIR=1). Confirming connection from host '\(hostDeviceId)'...")
+                print("[LOCAL-WORKER] PAIRING_AUTO_CONFIRMED")
+                self.isPairingInProgress = false
+                let profile = CapabilityProfile(deviceId: self.deviceId, deviceName: self.deviceName)
+                let profileData = try! JSONEncoder().encode(profile)
+                let profileDict = try! JSONSerialization.jsonObject(with: profileData) as! [String: Any]
+
+                let msg: [String: Any] = [
+                    "type": "PAIRING_CONFIRM",
+                    "initiationId": initiationId,
+                    "workerDeviceId": self.deviceId,
+                    "workerDeviceName": self.deviceName,
+                    "workerPublicKeyHex": pubKeyHex,
+                    "workerSaltHex": saltHex,
+                    "confirmedSasCode": sasCode,
+                    "capabilityProfile": profileDict
+                ]
+                self.send(json: msg)
+                print("[LOCAL-WORKER] PAIRING_CONFIRMED")
+                return
+            }
 
             DispatchQueue.global(qos: .userInteractive).async { [weak self] in
                 guard let self = self else { return }
@@ -251,6 +294,7 @@ public class SwarmClient {
                         "capabilityProfile": profileDict
                     ]
                     self.send(json: msg)
+                    print("[LOCAL-WORKER] PAIRING_CONFIRMED")
                 } else {
                     print("❌ Pairing rejected by user.")
                     let msg: [String: Any] = [
@@ -303,7 +347,9 @@ public class SwarmClient {
             if let sessionId = json["sessionId"] as? String {
                 PairingManager.shared.activateSession(sessionId: sessionId)
                 print("🔒 Secure session established (Session ID: \(sessionId)).")
+                print("[LOCAL-WORKER] REGISTERED")
                 self.sendTelemetryReport()
+                print("[LOCAL-WORKER] READY")
                 self.startTelemetryReporting()
             }
 
@@ -316,39 +362,41 @@ public class SwarmClient {
 
         case "EXECUTE_TASK":
             if let envDict = json["envelope"] as? [String: Any],
-               let envData = try? JSONSerialization.data(withJSONObject: envDict),
-               let envelope = try? JSONDecoder().decode(EncryptedEnvelope.self, from: envData),
-               let decryptedData = try? PairingManager.shared.decryptEnvelope(envelope: envelope),
-               let taskPayload = try? JSONDecoder().decode(TaskPayload.self, from: decryptedData) {
-                
-                let workerHost = Host.current().localizedName ?? ProcessInfo.processInfo.hostName
-                let workerPid = ProcessInfo.processInfo.processIdentifier
-                print("⚙️ [SwarmX Worker] Received Task [\(taskPayload.taskId)] on \(workerHost) (PID: \(workerPid))...")
-                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                    guard let self = self else { return }
-                    let resultPayload = ImageProcessingKernel.shared.processTask(payload: taskPayload)
-                    guard let resultData = try? JSONEncoder().encode(resultPayload) else { return }
+               let envData = try? JSONSerialization.data(withJSONObject: envDict) {
+                print("[WORKER] EXECUTE_TASK received (envelope bytes: \(envData.count))")
+                if let envelope = try? JSONDecoder().decode(EncryptedEnvelope.self, from: envData),
+                   let decryptedData = try? PairingManager.shared.decryptEnvelope(envelope: envelope),
+                   let taskPayload = try? JSONDecoder().decode(TaskPayload.self, from: decryptedData) {
                     
-                    // Strictly serialize encryption and wire transmission on the dedicated network queue
-                    self.queue.async {
-                        guard let resultEnvelope = try? PairingManager.shared.encryptEnvelope(payload: resultData) else { return }
+                    print("[WORKER] Payload decrypted and decoded")
+                    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                        guard let self = self else { return }
+                        let resultPayload = ImageProcessingKernel.shared.processTask(payload: taskPayload)
+                        guard let resultData = try? JSONEncoder().encode(resultPayload) else { return }
                         
-                        let envDict: [String: Any] = [
-                            "sessionId": resultEnvelope.sessionId,
-                            "sequenceNum": resultEnvelope.sequenceNum,
-                            "ivNonce": resultEnvelope.ivNonce,
-                            "ciphertext": resultEnvelope.ciphertext,
-                            "authTag": resultEnvelope.authTag
-                        ]
-                        let msg: [String: Any] = [
-                            "type": "TASK_RESULT",
-                            "workerDeviceId": self.deviceId,
-                            "taskId": taskPayload.taskId,
-                            "envelope": envDict
-                        ]
-                        self.send(json: msg)
-                        print("✅ [SwarmX Worker] Completed Task [\(taskPayload.taskId)] on \(workerHost) (PID: \(workerPid)) in \(resultPayload.executionTimeMs)ms")
+                        // Strictly serialize encryption and wire transmission on the dedicated network queue
+                        self.queue.async {
+                            guard let resultEnvelope = try? PairingManager.shared.encryptEnvelope(payload: resultData) else { return }
+                            
+                            let envDict: [String: Any] = [
+                                "sessionId": resultEnvelope.sessionId,
+                                "sequenceNum": resultEnvelope.sequenceNum,
+                                "ivNonce": resultEnvelope.ivNonce,
+                                "ciphertext": resultEnvelope.ciphertext,
+                                "authTag": resultEnvelope.authTag
+                            ]
+                            let msg: [String: Any] = [
+                                "type": "TASK_RESULT",
+                                "workerDeviceId": self.deviceId,
+                                "taskId": taskPayload.taskId,
+                                "envelope": envDict
+                            ]
+                            self.send(json: msg)
+                            print("[WORKER] TASK_RESULT encrypted and transmitted")
+                        }
                     }
+                } else {
+                    print("⚠️ [WORKER] Failed to decrypt or decode EXECUTE_TASK envelope")
                 }
             }
 

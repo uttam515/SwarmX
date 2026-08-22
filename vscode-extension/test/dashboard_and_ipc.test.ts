@@ -622,6 +622,64 @@ describe('VS Code Extension — Lifecycle & Dashboard Tests (Phase 4)', () => {
     expect(html).to.include('data-section="live-chunk-activity"');
   });
 
+  it('8b. DashboardViewProvider: Multi-Worker 2-Chunk Distribution Aggregation', () => {
+    const mockEnvManager: any = {
+      active: true,
+      forceSwarmDemo: true,
+      simulationMode: false
+    };
+
+    const provider = new DashboardViewProvider({} as any, ipcClient, mockEnvManager);
+    const html = (provider as any).getHtmlForWebview({
+      connected: true,
+      coreStatus: { totalTasks: 2, completedTasks: 2, runningTasks: 0 },
+      connectedWorkers: [
+        {
+          deviceId: 'macos-worker-host',
+          isEligible: true,
+          capabilityProfile: { deviceName: "Uttam's MacBook Air", cpuCores: 8, totalRamMb: 16384, hasGpu: true }
+        },
+        {
+          deviceId: 'macos-worker-remote',
+          isEligible: true,
+          capabilityProfile: { deviceName: "Jatin's MacBook Air", cpuCores: 8, totalRamMb: 16384, hasGpu: true }
+        }
+      ],
+      discoveredWorkers: [],
+      recentWorkloads: [
+        {
+          workloadId: 'wkl-matmul-live-2chunk',
+          taskId: 'wkl-matmul-live-2chunk',
+          kernelId: 'matrix_multiply_v1',
+          totalChunks: 2,
+          completedChunks: 2,
+          failedChunks: 0,
+          parameters: { M: 1024, K: 1024, N: 1024, totalChunks: 2 },
+          status: 'COMPLETE',
+          workerHostname: '2 Swarm Nodes',
+          localVsRemote: 'REMOTE',
+          estimatedGain: 2.1,
+          telemetry: {
+            chunkDistribution: [
+              { chunkIndex: 0, workerId: 'macos-worker-host', executionTimeMs: 15.2 },
+              { chunkIndex: 1, workerId: 'macos-worker-remote', executionTimeMs: 18.7 }
+            ]
+          }
+        }
+      ],
+      recentLogs: []
+    });
+
+    // Validates dynamic per-node distribution breakdown
+    expect(html).to.include("Host: 0");
+    expect(html).to.include("Uttam&#039;s MacBook Air: 1");
+    expect(html).to.include("Jatin&#039;s MacBook Air: 1");
+
+    // Validates individual chunk activity labels
+    expect(html).to.include("Chunk 00");
+    expect(html).to.include("Chunk 01");
+  });
+
   it('6. Tree Providers: Workers, Discovered, Tasks render correctly', async () => {
     const workersProvider = new WorkersTreeProvider(ipcClient);
     const discoveredProvider = new DiscoveredTreeProvider(ipcClient);

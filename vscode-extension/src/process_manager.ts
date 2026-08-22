@@ -368,6 +368,7 @@ export class ProcessManager {
     this.coreStatusState = 'STARTING';
 
     const env = this.getAugmentedEnv();
+    env['SWARMX_DEMO_IGNORE_BATTERY'] = 'true';
     const npmExe = this.resolveExecutable('npm', env);
     const nodeExe = this.resolveExecutable('node', env);
 
@@ -490,6 +491,7 @@ export class ProcessManager {
     this.workerStatusState = 'STARTING';
 
     const env = this.getAugmentedEnv();
+    env['SWARMX_AUTO_PAIR'] = '1';
     const swiftExe = this.resolveExecutable('swift', env);
 
     this.workerOutput.appendLine('----------------------------------------------------');

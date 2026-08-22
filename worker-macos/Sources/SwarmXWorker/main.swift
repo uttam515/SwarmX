@@ -1,8 +1,13 @@
 import Foundation
 
+// Unbuffer standard streams for responsive IDE pipe streaming
+setbuf(stdout, nil)
+setbuf(stderr, nil)
+
 print("---------------------------------------------------------")
 print("🍏 SwarmX Native macOS Worker (Phase 0 Foundations)")
 print("---------------------------------------------------------")
+print("[LOCAL-WORKER] PROCESS_STARTED")
 
 let options = WorkerCliOptions.parse(arguments: CommandLine.arguments)
 

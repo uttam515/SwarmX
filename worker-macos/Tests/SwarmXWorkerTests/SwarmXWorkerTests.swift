@@ -267,6 +267,34 @@ final class SwarmXWorkerTests: XCTestCase {
         XCTAssertEqual(empty, Data())
     }
 
+    func testNativeVideoFrameAnalysisKernel() {
+        let (w, h, channels, frames) = (32, 32, 4, 3)
+        let frameBytes = w * h * channels
+        var sample = Data(count: frames * frameBytes)
+        for i in 0..<sample.count {
+            sample[i] = UInt8((i * 17) % 256)
+        }
+
+        let kernel = ImageProcessingKernel.shared
+        let payload = TaskPayload(
+            taskId: "t-video-01",
+            attemptNumber: 1,
+            computationDescriptor: "{\"kernelId\":\"video_frame_analysis_v1\",\"parameters\":{\"width\":32,\"height\":32,\"channels\":4,\"frameCount\":3,\"startFrameIndex\":10}}",
+            inputRef: "ref",
+            inputData: sample.base64EncodedString(),
+            itemCount: 3
+        )
+
+        let result = kernel.processTask(payload: payload)
+        XCTAssertEqual(result.status, "COMPLETED")
+        XCTAssertTrue(result.outputData.contains("frameIndex"))
+        XCTAssertTrue(result.outputData.contains("10"))
+        XCTAssertTrue(result.outputData.contains("11"))
+        XCTAssertTrue(result.outputData.contains("12"))
+        XCTAssertTrue(result.outputData.contains("luminance"))
+        XCTAssertTrue(result.outputData.contains("motionEnergy"))
+    }
+
     func testNativeBoxBlurBenchmarkCalibration() {
         let resolutions = [(64, 64), (128, 128), (256, 256), (512, 512), (1024, 1024)]
         for (w, h) in resolutions {
@@ -429,6 +457,44 @@ final class SwarmXWorkerTests: XCTestCase {
                 XCTAssertEqual(fPtr[0], expectedVal, accuracy: 1e-3)
                 XCTAssertEqual(fPtr[totalElements - 1], expectedVal, accuracy: 1e-3)
             }
+        }
+    }
+
+    func testLargeMatrixMultiply1024() {
+        let n = 1024
+        let totalElements = n * n
+        var inFloats = [Float](repeating: 1.0, count: totalElements) + [Float](repeating: 2.0, count: totalElements)
+        let inData = Data(bytes: &inFloats, count: inFloats.count * 4)
+
+        let payload = TaskPayload(
+            taskId: "t-bench-1024",
+            attemptNumber: 1,
+            computationDescriptor: "{\"kernelId\":\"matrix_multiply_v1\",\"parameters\":{\"M\":\(n),\"K\":\(n),\"N\":\(n)}}",
+            inputRef: "ref",
+            inputData: inData.base64EncodedString(),
+            itemCount: 1
+        )
+
+        let start = DispatchTime.now()
+        let res = ImageProcessingKernel.shared.processTask(payload: payload)
+        let elapsedNs = DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds
+        let elapsedMs = Double(elapsedNs) / 1_000_000.0
+
+        XCTAssertEqual(res.status, "COMPLETED")
+        guard let outData = Data(base64Encoded: res.outputData) else {
+            XCTFail("Failed to decode output")
+            return
+        }
+
+        XCTAssertEqual(outData.count, totalElements * 4)
+        let gflops = (2.0 * Double(n * n * n)) / (elapsedMs * 1e6)
+        print("🚀 [Accelerate cblas_sgemm 1024x1024 Benchmark] 1024x1024x1024 GEMM: \(String(format: "%.2f", elapsedMs))ms (\(String(format: "%.2f", gflops)) GFLOPs/s)")
+
+        let expectedVal = Float(2.0 * Double(n))
+        outData.withUnsafeBytes { ptr in
+            let fPtr = ptr.bindMemory(to: Float.self)
+            XCTAssertEqual(fPtr[0], expectedVal, accuracy: 1e-3)
+            XCTAssertEqual(fPtr[totalElements - 1], expectedVal, accuracy: 1e-3)
         }
     }
 }

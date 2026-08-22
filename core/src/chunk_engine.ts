@@ -233,3 +233,313 @@ export class MatrixChunkEngine {
     return finalBuffer;
   }
 }
+
+export interface ImageChunkMetadata {
+  parentWorkloadId: string;
+  chunkIndex: number;
+  totalChunks: number;
+  outRowStart: number; // inclusive
+  outRowEnd: number;   // exclusive
+  outRowCount: number; // outRowEnd - outRowStart
+  inRowStart: number;  // inclusive with top halo
+  inRowEnd: number;    // exclusive with bottom halo
+  inRowCount: number;  // inRowEnd - inRowStart
+  topHalo: number;     // outRowStart - inRowStart
+  bottomHalo: number;  // inRowEnd - outRowEnd
+  width: number;
+  height: number;
+  channels: number;
+  radius: number;
+  mode: string;
+}
+
+export interface ImageChunkSpec {
+  metadata: ImageChunkMetadata;
+  payload: Buffer; // inRowCount * width * channels
+}
+
+export interface ImageChunkResult {
+  parentWorkloadId: string;
+  chunkIndex: number;
+  totalChunks: number;
+  outRowStart: number;
+  outRowEnd: number;
+  outRowCount: number;
+  inRowStart: number;
+  inRowEnd: number;
+  inRowCount: number;
+  topHalo: number;
+  bottomHalo: number;
+  width: number;
+  height: number;
+  channels: number;
+  radius: number;
+  outputBuffer: Buffer;
+  workerId?: string;
+  executionTimeMs?: number;
+}
+
+export class ImageChunkEngine {
+  /**
+   * Partitions a 2D planar image into `totalChunks` horizontal slices with radius-sized
+   * boundary halos to guarantee mathematically exact convolution/blur results.
+   */
+  public static partitionImageFilter(
+    parentWorkloadId: string,
+    width: number,
+    height: number,
+    channels: number,
+    mode: string,
+    radius: number,
+    totalChunks: number,
+    imageBuffer: Buffer
+  ): ImageChunkSpec[] {
+    if (width <= 0 || height <= 0 || channels <= 0) {
+      throw new Error(`Invalid image dimensions: ${width}x${height}, channels=${channels}`);
+    }
+    const expectedBytes = width * height * channels;
+    if (imageBuffer.length !== expectedBytes) {
+      throw new Error(`Invalid image buffer byte length: expected ${expectedBytes} bytes, got ${imageBuffer.length} bytes.`);
+    }
+
+    const actualChunks = Math.min(totalChunks, height);
+    const baseRows = Math.floor(height / actualChunks);
+    const remainder = height % actualChunks;
+    const bytesPerRow = width * channels;
+
+    const chunkSpecs: ImageChunkSpec[] = [];
+    let currentOutRow = 0;
+
+    for (let i = 0; i < actualChunks; i++) {
+      const outRowCount = baseRows + (i < remainder ? 1 : 0);
+      const outRowStart = currentOutRow;
+      const outRowEnd = currentOutRow + outRowCount;
+      currentOutRow = outRowEnd;
+
+      const inRowStart = Math.max(0, outRowStart - radius);
+      const inRowEnd = Math.min(height, outRowEnd + radius);
+      const inRowCount = inRowEnd - inRowStart;
+
+      const topHalo = outRowStart - inRowStart;
+      const bottomHalo = inRowEnd - outRowEnd;
+
+      const chunkStartByte = inRowStart * bytesPerRow;
+      const chunkEndByte = inRowEnd * bytesPerRow;
+      const chunkPayload = Buffer.from(imageBuffer.subarray(chunkStartByte, chunkEndByte));
+
+      chunkSpecs.push({
+        metadata: {
+          parentWorkloadId,
+          chunkIndex: i,
+          totalChunks: actualChunks,
+          outRowStart,
+          outRowEnd,
+          outRowCount,
+          inRowStart,
+          inRowEnd,
+          inRowCount,
+          topHalo,
+          bottomHalo,
+          width,
+          height,
+          channels,
+          radius,
+          mode
+        },
+        payload: chunkPayload
+      });
+    }
+
+    return chunkSpecs;
+  }
+
+  /**
+   * Reassembles independently computed horizontal image chunks by stripping the halo rows
+   * and copying only the valid output regions into the final contiguous image buffer.
+   */
+  public static assembleImageChunks(
+    parentWorkloadId: string,
+    width: number,
+    height: number,
+    channels: number,
+    chunkResults: ImageChunkResult[]
+  ): Buffer {
+    if (chunkResults.length === 0) {
+      throw new Error(`Cannot assemble image: received 0 chunk results.`);
+    }
+
+    const sorted = [...chunkResults].sort((a, b) => a.chunkIndex - b.chunkIndex);
+    const totalOutputBytes = width * height * channels;
+    const finalBuffer = Buffer.allocUnsafe(totalOutputBytes);
+    const bytesPerRow = width * channels;
+
+    let expectedNextRow = 0;
+
+    for (let i = 0; i < sorted.length; i++) {
+      const chunk = sorted[i];
+
+      if (chunk.parentWorkloadId !== parentWorkloadId) {
+        throw new Error(`Mismatched parentWorkloadId: expected ${parentWorkloadId}, got ${chunk.parentWorkloadId}.`);
+      }
+
+      if (chunk.chunkIndex !== i) {
+        throw new Error(`Missing or out-of-order chunk index: expected index ${i}, but got ${chunk.chunkIndex}.`);
+      }
+
+      if (chunk.outRowStart !== expectedNextRow) {
+        throw new Error(`Row gap/overlap in image chunk ${chunk.chunkIndex}: expected row ${expectedNextRow}, got ${chunk.outRowStart}.`);
+      }
+
+      const expectedChunkOutputBytes = chunk.inRowCount * bytesPerRow;
+      if (chunk.outputBuffer.length !== expectedChunkOutputBytes) {
+        throw new Error(
+          `Incorrect output byte length in chunk ${chunk.chunkIndex}: expected ${expectedChunkOutputBytes} bytes (${chunk.inRowCount}x${width}x${channels}), got ${chunk.outputBuffer.length} bytes.`
+        );
+      }
+
+      // Extract valid rows (skip topHalo, take outRowCount)
+      const validStartByte = chunk.topHalo * bytesPerRow;
+      const validByteLength = chunk.outRowCount * bytesPerRow;
+      const validRowsSlice = chunk.outputBuffer.subarray(validStartByte, validStartByte + validByteLength);
+
+      const destOffset = chunk.outRowStart * bytesPerRow;
+      validRowsSlice.copy(finalBuffer, destOffset);
+
+      expectedNextRow = chunk.outRowEnd;
+    }
+
+    if (expectedNextRow !== height) {
+      throw new Error(`Incomplete image coverage: chunks cover up to row ${expectedNextRow}, but height=${height}.`);
+    }
+
+    return finalBuffer;
+  }
+}
+
+export interface VideoChunkMetadata {
+  parentWorkloadId: string;
+  chunkIndex: number;
+  totalChunks: number;
+  startFrameIndex: number;
+  frameCount: number;
+  width: number;
+  height: number;
+  channels: number;
+  mode: string;
+}
+
+export interface VideoChunkSpec {
+  metadata: VideoChunkMetadata;
+  payload: Buffer; // frameCount * width * height * channels
+}
+
+export interface VideoChunkResult {
+  parentWorkloadId: string;
+  chunkIndex: number;
+  totalChunks: number;
+  startFrameIndex: number;
+  frameCount: number;
+  outputData: string | any[];
+  workerId?: string;
+  executionTimeMs?: number;
+}
+
+export class VideoChunkEngine {
+  /**
+   * Partitions sequential video frames into independent chunks for distributed analysis.
+   */
+  public static partitionVideoFrames(
+    parentWorkloadId: string,
+    width: number,
+    height: number,
+    channels: number,
+    mode: string,
+    totalFrames: number,
+    chunkSize: number,
+    videoBuffer: Buffer
+  ): VideoChunkSpec[] {
+    if (width <= 0 || height <= 0 || channels <= 0 || totalFrames <= 0) {
+      throw new Error(`Invalid video dimensions: ${width}x${height}x${channels}, totalFrames=${totalFrames}`);
+    }
+    const frameBytes = width * height * channels;
+    const expectedBytes = totalFrames * frameBytes;
+    if (videoBuffer.length < expectedBytes) {
+      throw new Error(`Invalid video buffer byte length: expected ${expectedBytes} bytes, got ${videoBuffer.length} bytes.`);
+    }
+
+    const actualChunkSize = Math.max(1, chunkSize);
+    const totalChunks = Math.ceil(totalFrames / actualChunkSize);
+    const specs: VideoChunkSpec[] = [];
+
+    for (let i = 0; i < totalChunks; i++) {
+      const startFrame = i * actualChunkSize;
+      const framesInChunk = Math.min(actualChunkSize, totalFrames - startFrame);
+      const startByte = startFrame * frameBytes;
+      const endByte = startByte + (framesInChunk * frameBytes);
+      const chunkPayload = Buffer.from(videoBuffer.subarray(startByte, endByte));
+
+      specs.push({
+        metadata: {
+          parentWorkloadId,
+          chunkIndex: i,
+          totalChunks,
+          startFrameIndex: startFrame,
+          frameCount: framesInChunk,
+          width,
+          height,
+          channels,
+          mode
+        },
+        payload: chunkPayload
+      });
+    }
+
+    return specs;
+  }
+
+  /**
+   * Reassembles and sorts independent per-chunk frame analysis results into a single sequential frame array.
+   */
+  public static assembleVideoAnalysis(
+    parentWorkloadId: string,
+    chunkResults: VideoChunkResult[]
+  ): any[] {
+    if (chunkResults.length === 0) {
+      throw new Error('Cannot assemble video analysis: received 0 chunk results.');
+    }
+
+    const sorted = [...chunkResults].sort((a, b) => a.chunkIndex - b.chunkIndex);
+    const aggregated: any[] = [];
+
+    for (let i = 0; i < sorted.length; i++) {
+      const chunk = sorted[i];
+      if (chunk.parentWorkloadId !== parentWorkloadId) {
+        throw new Error(`Mismatched parentWorkloadId: expected ${parentWorkloadId}, got ${chunk.parentWorkloadId}`);
+      }
+      if (chunk.chunkIndex !== i) {
+        throw new Error(`Missing or out-of-order chunk index: expected index ${i}, got ${chunk.chunkIndex}`);
+      }
+
+      let parsedMetrics: any[] = [];
+      if (typeof chunk.outputData === 'string') {
+        try {
+          parsedMetrics = JSON.parse(chunk.outputData);
+        } catch {
+          try {
+            parsedMetrics = JSON.parse(Buffer.from(chunk.outputData, 'base64').toString('utf-8'));
+          } catch {
+            parsedMetrics = [];
+          }
+        }
+      } else if (Array.isArray(chunk.outputData)) {
+        parsedMetrics = chunk.outputData;
+      }
+
+      for (const m of parsedMetrics) {
+        aggregated.push(m);
+      }
+    }
+
+    return aggregated;
+  }
+}

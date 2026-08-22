@@ -1,6 +1,6 @@
 import 'mocha';
 import { expect } from 'chai';
-import { MatrixChunkEngine, MatrixChunkSpec, MatrixChunkResult } from '../src/chunk_engine';
+import { MatrixChunkEngine, MatrixChunkSpec, MatrixChunkResult, ImageChunkEngine, ImageChunkSpec, ImageChunkResult, VideoChunkEngine, VideoChunkSpec, VideoChunkResult } from '../src/chunk_engine';
 
 describe('MatrixChunkEngine Subsystem Tests (Phase 5A)', () => {
   // Helper to create Float32 buffer from flat array
@@ -282,6 +282,205 @@ describe('MatrixChunkEngine Subsystem Tests (Phase 5A)', () => {
     // Diagonals must be exactly 6.0
     for (let i = 0; i < 256; i++) {
       expect(assembledF32[i * 256 + i]).to.be.closeTo(6.0, 1e-5);
+    }
+  });
+});
+
+describe('ImageChunkEngine Subsystem Tests (BoxBlur Horizontal Partitioning & Reassembly)', () => {
+  // Reference 2D BoxBlur implementation for testing
+  const applyReferenceBoxBlur = (input: Buffer, width: number, height: number, channels: number, radius: number): Buffer => {
+    const temp = Buffer.alloc(width * height * channels);
+    const output = Buffer.alloc(width * height * channels);
+    const windowCount = 2 * radius + 1;
+
+    // Horizontal pass
+    for (let y = 0; y < height; y++) {
+      const rowOffset = y * width * channels;
+      for (let c = 0; c < channels; c++) {
+        let sum = 0;
+        for (let k = -radius; k <= radius; k++) {
+          const cx = Math.max(0, Math.min(width - 1, k));
+          sum += input[rowOffset + cx * channels + c];
+        }
+        temp[rowOffset + c] = Math.floor(sum / windowCount);
+        for (let x = 1; x < width; x++) {
+          const leftIdx = Math.max(0, Math.min(width - 1, x - radius - 1));
+          const rightIdx = Math.max(0, Math.min(width - 1, x + radius));
+          sum += input[rowOffset + rightIdx * channels + c] - input[rowOffset + leftIdx * channels + c];
+          temp[rowOffset + x * channels + c] = Math.floor(sum / windowCount);
+        }
+      }
+    }
+
+    // Vertical pass
+    for (let x = 0; x < width; x++) {
+      const colOffset = x * channels;
+      for (let c = 0; c < channels; c++) {
+        let sum = 0;
+        for (let k = -radius; k <= radius; k++) {
+          const cy = Math.max(0, Math.min(height - 1, k));
+          sum += temp[cy * width * channels + colOffset + c];
+        }
+        output[colOffset + c] = Math.floor(sum / windowCount);
+        for (let y = 1; y < height; y++) {
+          const topIdx = Math.max(0, Math.min(height - 1, y - radius - 1));
+          const botIdx = Math.max(0, Math.min(height - 1, y + radius));
+          sum += temp[botIdx * width * channels + colOffset + c] - temp[topIdx * width * channels + colOffset + c];
+          output[y * width * channels + colOffset + c] = Math.floor(sum / windowCount);
+        }
+      }
+    }
+
+    return output;
+  };
+
+  const executeImageChunk = (spec: ImageChunkSpec): ImageChunkResult => {
+    const { width, inRowCount, channels, radius, chunkIndex, totalChunks, parentWorkloadId, outRowStart, outRowEnd, outRowCount, inRowStart, inRowEnd, topHalo, bottomHalo } = spec.metadata;
+    const chunkOutput = applyReferenceBoxBlur(spec.payload, width, inRowCount, channels, radius);
+
+    return {
+      parentWorkloadId,
+      chunkIndex,
+      totalChunks,
+      outRowStart,
+      outRowEnd,
+      outRowCount,
+      inRowStart,
+      inRowEnd,
+      inRowCount,
+      topHalo,
+      bottomHalo,
+      width,
+      height: spec.metadata.height,
+      channels,
+      radius,
+      outputBuffer: chunkOutput
+    };
+  };
+
+  it('1. 2-Chunk Partitioning: Calculates exact row boundaries and radius-sized halos', () => {
+    const width = 128, height = 128, channels = 4, radius = 5;
+    const buf = Buffer.alloc(width * height * channels, 128);
+
+    const specs = ImageChunkEngine.partitionImageFilter('wkl-img-01', width, height, channels, 'RGBA', radius, 2, buf);
+    expect(specs.length).to.equal(2);
+
+    // Chunk 0: Rows [0, 64), inRows [0, 69) (topHalo=0, bottomHalo=5)
+    expect(specs[0].metadata.outRowStart).to.equal(0);
+    expect(specs[0].metadata.outRowEnd).to.equal(64);
+    expect(specs[0].metadata.outRowCount).to.equal(64);
+    expect(specs[0].metadata.inRowStart).to.equal(0);
+    expect(specs[0].metadata.inRowEnd).to.equal(69);
+    expect(specs[0].metadata.inRowCount).to.equal(69);
+    expect(specs[0].metadata.topHalo).to.equal(0);
+    expect(specs[0].metadata.bottomHalo).to.equal(5);
+    expect(specs[0].payload.length).to.equal(69 * width * channels);
+
+    // Chunk 1: Rows [64, 128), inRows [59, 128) (topHalo=5, bottomHalo=0)
+    expect(specs[1].metadata.outRowStart).to.equal(64);
+    expect(specs[1].metadata.outRowEnd).to.equal(128);
+    expect(specs[1].metadata.outRowCount).to.equal(64);
+    expect(specs[1].metadata.inRowStart).to.equal(59);
+    expect(specs[1].metadata.inRowEnd).to.equal(128);
+    expect(specs[1].metadata.inRowCount).to.equal(69);
+    expect(specs[1].metadata.topHalo).to.equal(5);
+    expect(specs[1].metadata.bottomHalo).to.equal(0);
+    expect(specs[1].payload.length).to.equal(69 * width * channels);
+  });
+
+  it('2. Bit-Exact Boundary Reassembly: 2-chunk parallel blur matches single-pass reference blur identically', () => {
+    const width = 64, height = 64, channels = 4, radius = 3;
+    const inputBuf = Buffer.alloc(width * height * channels);
+
+    // Fill with deterministic gradient pattern
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const idx = (y * width + x) * channels;
+        inputBuf[idx] = (x * 4) % 256;
+        inputBuf[idx + 1] = (y * 4) % 256;
+        inputBuf[idx + 2] = (x + y) % 256;
+        inputBuf[idx + 3] = 255;
+      }
+    }
+
+    // 1. Single-pass full image reference
+    const referenceOutput = applyReferenceBoxBlur(inputBuf, width, height, channels, radius);
+
+    // 2. 2-Chunk distributed execution
+    const specs = ImageChunkEngine.partitionImageFilter('wkl-img-02', width, height, channels, 'RGBA', radius, 2, inputBuf);
+    const chunkResults = specs.map(executeImageChunk);
+    const assembledOutput = ImageChunkEngine.assembleImageChunks('wkl-img-02', width, height, channels, chunkResults);
+
+    expect(assembledOutput.length).to.equal(referenceOutput.length);
+    expect(assembledOutput.equals(referenceOutput)).to.be.true; // 100% bit-exact match across seam boundary!
+  });
+
+  it('3. Odd Dimension & Multi-Chunk (4 Chunks): Preserves coverage and bit-exact reconstruction', () => {
+    const width = 100, height = 105, channels = 4, radius = 4;
+    const inputBuf = Buffer.alloc(width * height * channels);
+    for (let i = 0; i < inputBuf.length; i++) inputBuf[i] = (i * 17) % 256;
+
+    const referenceOutput = applyReferenceBoxBlur(inputBuf, width, height, channels, radius);
+
+    const specs = ImageChunkEngine.partitionImageFilter('wkl-img-03', width, height, channels, 'RGBA', radius, 4, inputBuf);
+    expect(specs.length).to.equal(4);
+
+    const chunkResults = specs.map(executeImageChunk);
+    const assembledOutput = ImageChunkEngine.assembleImageChunks('wkl-img-03', width, height, channels, chunkResults);
+
+    expect(assembledOutput.equals(referenceOutput)).to.be.true;
+  });
+});
+
+describe('VideoChunkEngine Subsystem Tests (Dynamic Frame Chunking & Metadata Aggregation)', () => {
+  it('1. 30 Chunks: Correctly partitions 900 frames into 30 frame-chunks', () => {
+    const width = 64, height = 64, channels = 4, totalFrames = 900, chunkSize = 30;
+    const frameBytes = width * height * channels;
+    const buf = Buffer.alloc(totalFrames * frameBytes);
+
+    const specs = VideoChunkEngine.partitionVideoFrames('wkl-vid-01', width, height, channels, 'RGBA', totalFrames, chunkSize, buf);
+    expect(specs.length).to.equal(30);
+
+    for (let i = 0; i < 30; i++) {
+      expect(specs[i].metadata.chunkIndex).to.equal(i);
+      expect(specs[i].metadata.startFrameIndex).to.equal(i * 30);
+      expect(specs[i].metadata.frameCount).to.equal(30);
+      expect(specs[i].payload.length).to.equal(30 * frameBytes);
+    }
+  });
+
+  it('2. Aggregates and preserves exact sequential frame order across out-of-order completions', () => {
+    const chunkResults: VideoChunkResult[] = [
+      {
+        parentWorkloadId: 'wkl-vid-02',
+        chunkIndex: 1,
+        totalChunks: 3,
+        startFrameIndex: 2,
+        frameCount: 2,
+        outputData: JSON.stringify([{ frameIndex: 2, lum: 100 }, { frameIndex: 3, lum: 110 }])
+      },
+      {
+        parentWorkloadId: 'wkl-vid-02',
+        chunkIndex: 0,
+        totalChunks: 3,
+        startFrameIndex: 0,
+        frameCount: 2,
+        outputData: JSON.stringify([{ frameIndex: 0, lum: 80 }, { frameIndex: 1, lum: 90 }])
+      },
+      {
+        parentWorkloadId: 'wkl-vid-02',
+        chunkIndex: 2,
+        totalChunks: 3,
+        startFrameIndex: 4,
+        frameCount: 2,
+        outputData: JSON.stringify([{ frameIndex: 4, lum: 120 }, { frameIndex: 5, lum: 130 }])
+      }
+    ];
+
+    const aggregated = VideoChunkEngine.assembleVideoAnalysis('wkl-vid-02', chunkResults);
+    expect(aggregated.length).to.equal(6);
+    for (let i = 0; i < 6; i++) {
+      expect(aggregated[i].frameIndex).to.equal(i);
     }
   });
 });

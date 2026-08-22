@@ -129,6 +129,9 @@ public class ImageProcessingKernel {
                 let cCount = m * n
                 var c = [Float](repeating: 0, count: cCount)
 
+                print("[WORKER] GEMM started (\(m)x\(k) @ \(k)x\(n))")
+                let tGemmStart = DispatchTime.now()
+
                 rawBytes.withUnsafeBytes { rawPtr in
                     guard let fPtr = rawPtr.bindMemory(to: Float.self).baseAddress else { return }
                     let aPtr = fPtr
@@ -154,8 +157,48 @@ public class ImageProcessingKernel {
                     )
                 }
 
+                let tGemmElapsedMs = max(1, Int64((DispatchTime.now().uptimeNanoseconds - tGemmStart.uptimeNanoseconds) / 1_000_000))
+                print("[WORKER] GEMM completed in \(tGemmElapsedMs)ms")
+
                 let outData = Data(bytes: c, count: cCount * 4)
                 outputDataString = outData.base64EncodedString()
+            } else if payload.computationDescriptor.contains("video_frame_analysis") || payload.computationDescriptor.contains("video_analysis") {
+                // 4. Certified video_frame_analysis_v1 (Multi-frame luminance, gradient edge energy, and motion analysis)
+                var width = 512
+                var height = 512
+                var channels = 4
+                var frameCount = 1
+                var startFrameIndex = 0
+
+                if let descData = payload.computationDescriptor.data(using: .utf8),
+                   let json = try? JSONSerialization.jsonObject(with: descData) as? [String: Any] {
+                    let params = (json["parameters"] as? [String: Any]) ?? json
+                    width = (params["width"] as? Int) ?? width
+                    height = (params["height"] as? Int) ?? height
+                    channels = (params["channels"] as? Int) ?? channels
+                    frameCount = (params["frameCount"] as? Int) ?? (params["frames"] as? Int) ?? (params["chunkSize"] as? Int) ?? frameCount
+                    startFrameIndex = (params["startFrameIndex"] as? Int) ?? (params["startFrame"] as? Int) ?? 0
+                }
+
+                let frameBytes = width * height * channels
+                if frameBytes > 0 && rawBytes.count >= frameBytes {
+                    let actualFrames = max(1, min(frameCount, rawBytes.count / frameBytes))
+                    print("[WORKER] Video frame analysis started (\(actualFrames) frames of \(width)x\(height)x\(channels), startFrame=\(startFrameIndex))")
+                    let tStart = DispatchTime.now()
+                    let jsonResult = ImageProcessingKernel.analyzeVideoFrames(
+                        input: rawBytes,
+                        width: width,
+                        height: height,
+                        channels: channels,
+                        frameCount: actualFrames,
+                        startFrameIndex: startFrameIndex
+                    )
+                    let tElapsedMs = max(1, Int64((DispatchTime.now().uptimeNanoseconds - tStart.uptimeNanoseconds) / 1_000_000))
+                    print("[WORKER] Video frame analysis completed in \(tElapsedMs)ms (\(actualFrames) frames)")
+                    outputDataString = jsonResult
+                } else {
+                    outputDataString = "[]"
+                }
             } else {
                 // Default legacy filters (invert, grayscale, scaling)
                 var processed = Data(count: rawBytes.count)
@@ -284,5 +327,104 @@ public class ImageProcessingKernel {
         }
 
         return Data(output)
+    }
+
+    /**
+     * Executes native multi-frame video analysis (luminance, gradient edge energy, and motion energy).
+     * Operates over a contiguous array of raw frame bytes and returns a compact JSON summary string.
+     */
+    public static func analyzeVideoFrames(
+        input: Data,
+        width: Int,
+        height: Int,
+        channels: Int,
+        frameCount: Int,
+        startFrameIndex: Int = 0
+    ) -> String {
+        let frameBytes = width * height * channels
+        guard width > 0, height > 0, channels > 0, frameCount > 0, input.count >= frameCount * frameBytes else {
+            return "[]"
+        }
+
+        var results: [[String: Any]] = []
+        results.reserveCapacity(frameCount)
+
+        input.withUnsafeBytes { rawPtr in
+            guard let basePtr = rawPtr.bindMemory(to: UInt8.self).baseAddress else { return }
+            var prevFramePtr: UnsafePointer<UInt8>? = nil
+
+            for f in 0..<frameCount {
+                let currentFramePtr = basePtr.advanced(by: f * frameBytes)
+                let totalPixels = width * height
+
+                var sumLum: Double = 0.0
+                var sumLumSq: Double = 0.0
+                var sumEdgeEnergy: Double = 0.0
+                var sumMotion: Double = 0.0
+
+                for y in 0..<height {
+                    let rowOffset = y * width * channels
+                    let nextRowOffset = min(height - 1, y + 1) * width * channels
+
+                    for x in 0..<width {
+                        let pxOffset = rowOffset + x * channels
+                        let nextPxOffset = rowOffset + min(width - 1, x + 1) * channels
+                        let downPxOffset = nextRowOffset + x * channels
+
+                        let r = Double(currentFramePtr[pxOffset])
+                        let g = Double(currentFramePtr[pxOffset + min(1, channels - 1)])
+                        let b = Double(currentFramePtr[pxOffset + min(2, channels - 1)])
+                        let lum = 0.299 * r + 0.587 * g + 0.114 * b
+
+                        sumLum += lum
+                        sumLumSq += lum * lum
+
+                        let nextR = Double(currentFramePtr[nextPxOffset])
+                        let nextG = Double(currentFramePtr[nextPxOffset + min(1, channels - 1)])
+                        let nextB = Double(currentFramePtr[nextPxOffset + min(2, channels - 1)])
+                        let nextLum = 0.299 * nextR + 0.587 * nextG + 0.114 * nextB
+
+                        let downR = Double(currentFramePtr[downPxOffset])
+                        let downG = Double(currentFramePtr[downPxOffset + min(1, channels - 1)])
+                        let downB = Double(currentFramePtr[downPxOffset + min(2, channels - 1)])
+                        let downLum = 0.299 * downR + 0.587 * downG + 0.114 * downB
+
+                        let dx = abs(nextLum - lum)
+                        let dy = abs(downLum - lum)
+                        sumEdgeEnergy += (dx + dy)
+
+                        if let prevPtr = prevFramePtr {
+                            let prevR = Double(prevPtr[pxOffset])
+                            let prevG = Double(prevPtr[pxOffset + min(1, channels - 1)])
+                            let prevB = Double(prevPtr[pxOffset + min(2, channels - 1)])
+                            let prevLum = 0.299 * prevR + 0.587 * prevG + 0.114 * prevB
+                            sumMotion += abs(lum - prevLum)
+                        }
+                    }
+                }
+
+                let meanLum = sumLum / Double(totalPixels)
+                let varianceLum = max(0.0, (sumLumSq / Double(totalPixels)) - (meanLum * meanLum))
+                let edgeDensity = sumEdgeEnergy / Double(totalPixels)
+                let motionEnergy = prevFramePtr != nil ? (sumMotion / Double(totalPixels)) : 0.0
+                let blurScore = sqrt(varianceLum) * (edgeDensity / 10.0)
+
+                results.append([
+                    "frameIndex": startFrameIndex + f,
+                    "luminance": round(meanLum * 100.0) / 100.0,
+                    "edgeDensity": round(edgeDensity * 100.0) / 100.0,
+                    "motionEnergy": round(motionEnergy * 100.0) / 100.0,
+                    "blurScore": round(blurScore * 100.0) / 100.0
+                ])
+
+                prevFramePtr = currentFramePtr
+            }
+        }
+
+        if let jsonData = try? JSONSerialization.data(withJSONObject: results, options: []),
+           let jsonStr = String(data: jsonData, encoding: .utf8) {
+            return jsonStr
+        }
+        return "[]"
     }
 }

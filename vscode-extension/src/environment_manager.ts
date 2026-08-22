@@ -67,6 +67,7 @@ export class EnvironmentManager {
       // Inject PYTHONPATH into all workspace terminals and execution contexts
       collection.replace('PYTHONPATH', this.pythonSdkPath);
       collection.replace('SWARMX_IPC_PATH', '/tmp/swarmx.sock');
+      collection.replace('SWARMX_DEMO_IGNORE_BATTERY', 'true');
 
       if (this.isForceSwarmDemo) {
         collection.replace('SWARMX_FORCE_SWARM', '1');
@@ -91,6 +92,7 @@ export class EnvironmentManager {
       if (enable && this.pythonSdkPath) {
         updated['PYTHONPATH'] = this.pythonSdkPath;
         updated['SWARMX_IPC_PATH'] = '/tmp/swarmx.sock';
+        updated['SWARMX_DEMO_IGNORE_BATTERY'] = 'true';
         if (this.isForceSwarmDemo) {
           updated['SWARMX_FORCE_SWARM'] = '1';
         } else {
@@ -100,6 +102,7 @@ export class EnvironmentManager {
         delete updated['PYTHONPATH'];
         delete updated['SWARMX_IPC_PATH'];
         delete updated['SWARMX_FORCE_SWARM'];
+        delete updated['SWARMX_DEMO_IGNORE_BATTERY'];
       }
 
       await terminalConfig.update('osx', updated, vscode.ConfigurationTarget.Workspace);

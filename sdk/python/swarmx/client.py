@@ -27,6 +27,9 @@ class SwarmClient:
     Maintains persistent thread-isolated Unix socket connections with automatic reconnect on disruption.
     """
     def __init__(self, socket_path: str = "/tmp/swarmx.sock", timeout: float = 30.0):
+        env_timeout = os.environ.get("SWARMX_WORKLOAD_TIMEOUT_MS")
+        if env_timeout:
+            timeout = float(env_timeout) / 1000.0
         self.socket_path = socket_path
         self.timeout = timeout
         self.sock: Optional[socket.socket] = None
@@ -121,8 +124,19 @@ class SwarmClient:
 
         t_start = time.perf_counter()
 
+        env_timeout = os.environ.get("SWARMX_WORKLOAD_TIMEOUT_MS")
+        if env_timeout:
+            effective_timeout = float(env_timeout) / 1000.0
+        else:
+            # Size-aware timeout: 30s base + 1.5s per MB of payload
+            # (1024x1024 [8MB]: 42s; 2048x2048 [32MB]: 78s; 4096x4096 [128MB]: 222s)
+            payload_mb = len(raw_payload_bytes) / (1024 * 1024)
+            effective_timeout = max(30.0, min(300.0, 30.0 + payload_mb * 1.5))
+
         for attempt in range(2):
             self._ensure_connected()
+            if self.sock:
+                self.sock.settimeout(effective_timeout)
             req_id = self._req_id
             self._req_id += 1
 

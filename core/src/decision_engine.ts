@@ -162,12 +162,16 @@ export class DistributionDecisionEngine {
       };
     }
 
+    const ignoreBattery = process.env.SWARMX_DEMO_IGNORE_BATTERY === 'true' ||
+                          process.env.SWARMX_DEMO_IGNORE_BATTERY === '1' ||
+                          process.env.SWARMX_FORCE_SWARM === '1';
+
     // 3. Gating Rule: Filter Eligible Workers with Kernel Platform Support
     const eligibleWorkers = connectedWorkers.filter(w => {
       if (w.telemetry) {
         if (w.telemetry.cpuUtilization >= 0.90) return false;
         if (w.telemetry.thermalState >= 2) return false; // SERIOUS or CRITICAL
-        if (!w.telemetry.isCharging && w.telemetry.batteryLevel < 0.20) return false;
+        if (!ignoreBattery && !w.telemetry.isCharging && w.telemetry.batteryLevel < 0.20) return false;
       }
       if (w.capabilityProfile) {
         if (!this.kernelRegistry.isPlatformSupported(kernelId, w.capabilityProfile.osType)) {

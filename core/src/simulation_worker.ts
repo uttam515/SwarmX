@@ -97,6 +97,88 @@ parentPort.on('message', (msg) => {
         elapsedMs: elapsed,
         outBuffer: outFloats.buffer
       }, [outFloats.buffer]);
+    } else if (kernelId === 'video_frame_analysis_v1') {
+      const { width = 512, height = 512, mode = 'RGBA', frameCount = 1, startFrameIndex = 0 } = params;
+      const channels = mode === 'RGB' ? 3 : (mode === 'L' ? 1 : 4);
+      const frameBytes = width * height * channels;
+      const input = Buffer.from(payloadBuffer);
+      const actualFrames = Math.max(1, Math.min(frameCount, Math.floor(input.length / frameBytes)));
+      const results = [];
+      let prevFrameOffset = -1;
+
+      for (let f = 0; f < actualFrames; f++) {
+        const frameOffset = f * frameBytes;
+        const totalPixels = width * height;
+        let sumLum = 0.0;
+        let sumLumSq = 0.0;
+        let sumEdgeEnergy = 0.0;
+        let sumMotion = 0.0;
+
+        for (let y = 0; y < height; y++) {
+          const rowOffset = frameOffset + y * width * channels;
+          const nextRowOffset = frameOffset + Math.min(height - 1, y + 1) * width * channels;
+
+          for (let x = 0; x < width; x++) {
+            const px = rowOffset + x * channels;
+            const nextPx = rowOffset + Math.min(width - 1, x + 1) * channels;
+            const downPx = nextRowOffset + x * channels;
+
+            const r = input[px];
+            const g = input[px + Math.min(1, channels - 1)];
+            const b = input[px + Math.min(2, channels - 1)];
+            const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+            sumLum += lum;
+            sumLumSq += lum * lum;
+
+            const nextR = input[nextPx];
+            const nextG = input[nextPx + Math.min(1, channels - 1)];
+            const nextB = input[nextPx + Math.min(2, channels - 1)];
+            const nextLum = 0.299 * nextR + 0.587 * nextG + 0.114 * nextB;
+
+            const downR = input[downPx];
+            const downG = input[downPx + Math.min(1, channels - 1)];
+            const downB = input[downPx + Math.min(2, channels - 1)];
+            const downLum = 0.299 * downR + 0.587 * downG + 0.114 * downB;
+
+            sumEdgeEnergy += Math.abs(nextLum - lum) + Math.abs(downLum - lum);
+
+            if (prevFrameOffset >= 0) {
+              const prevPx = prevFrameOffset + (y * width + x) * channels;
+              const prevR = input[prevPx];
+              const prevG = input[prevPx + Math.min(1, channels - 1)];
+              const prevB = input[prevPx + Math.min(2, channels - 1)];
+              const prevLum = 0.299 * prevR + 0.587 * prevG + 0.114 * prevB;
+              sumMotion += Math.abs(lum - prevLum);
+            }
+          }
+        }
+
+        const meanLum = sumLum / totalPixels;
+        const varianceLum = Math.max(0.0, (sumLumSq / totalPixels) - (meanLum * meanLum));
+        const edgeDensity = sumEdgeEnergy / totalPixels;
+        const motionEnergy = prevFrameOffset >= 0 ? (sumMotion / totalPixels) : 0.0;
+        const blurScore = Math.sqrt(varianceLum) * (edgeDensity / 10.0);
+
+        results.push({
+          frameIndex: startFrameIndex + f,
+          luminance: Math.round(meanLum * 100) / 100,
+          edgeDensity: Math.round(edgeDensity * 100) / 100,
+          motionEnergy: Math.round(motionEnergy * 100) / 100,
+          blurScore: Math.round(blurScore * 100) / 100
+        });
+
+        prevFrameOffset = frameOffset;
+      }
+
+      const jsonStr = JSON.stringify(results);
+      const jsonBuf = Buffer.from(jsonStr, 'utf-8');
+      const elapsed = Date.now() - startMs;
+      parentPort.postMessage({
+        taskId,
+        threadId,
+        elapsedMs: elapsed,
+        outBuffer: jsonBuf.buffer
+      }, [jsonBuf.buffer]);
     } else {
       // 2D Separable BoxBlur
       const { radius = 2, width = 0, height = 0, mode = 'RGBA' } = params;

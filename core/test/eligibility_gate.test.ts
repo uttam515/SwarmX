@@ -56,6 +56,11 @@ describe('WorkerManager & Eligibility Gate Tests', () => {
 
     // Sufficient battery (>= 20%), unplugged -> ELIGIBLE (1)
     expect(workerManager.evaluateEligibility({ ...baseTelemetry, batteryLevel: 0.20 })).to.be.true;
+
+    // Demo Mode Override: SWARMX_DEMO_IGNORE_BATTERY=true makes low battery eligible
+    process.env.SWARMX_DEMO_IGNORE_BATTERY = 'true';
+    expect(workerManager.evaluateEligibility(baseTelemetry)).to.be.true;
+    delete process.env.SWARMX_DEMO_IGNORE_BATTERY;
   });
 
   it('Eligibility Gate: Thermal Rule (NOMINAL / FAIR only)', () => {

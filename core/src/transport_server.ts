@@ -46,20 +46,17 @@ export class TransportServer {
 
   public async start(): Promise<void> {
     this.server = http.createServer();
-    this.wss = new WebSocketServer({ server: this.server });
+    this.wss = new WebSocketServer({ server: this.server, maxPayload: 256 * 1024 * 1024 });
 
     this.wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
       let workerDeviceId: string | null = null;
       const remoteAddress = req?.socket?.remoteAddress || '127.0.0.1';
+      (ws as any)._remoteAddress = remoteAddress;
       Logger.transport(`WebSocket accepted from ${remoteAddress}`);
 
       ws.on('message', async (data: Buffer | string) => {
         try {
           const msg = JSON.parse(data.toString('utf-8'));
-          const response = await this.handleWorkerMessage(msg, ws);
-          if (response) {
-            ws.send(JSON.stringify(response));
-          }
           const devId = msg.deviceId || msg.workerDeviceId || (ws as any)._workerDeviceId;
           if (devId) {
             const existingWs = this.workerSockets.get(devId);
@@ -69,6 +66,10 @@ export class TransportServer {
             workerDeviceId = devId;
             (ws as any)._workerDeviceId = devId;
             this.workerSockets.set(workerDeviceId!, ws);
+          }
+          const response = await this.handleWorkerMessage(msg, ws);
+          if (response) {
+            ws.send(JSON.stringify(response));
           }
         } catch (err: any) {
           Logger.error(`Transport error handling message from ${workerDeviceId || (ws as any)._workerDeviceId || 'unknown'}: ${err.message}`);
@@ -153,7 +154,7 @@ export class TransportServer {
     initiation: { initiationId: string; hostPublicKeyHex: string; hostDeviceId: string }
   ): boolean {
     const ws = this.workerSockets.get(workerDeviceId);
-    if (!ws || ws.readyState !== ws.OPEN) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
       Logger.error(`Failed to send pairing request: Worker ${workerDeviceId} socket not connected/open`);
       return false;
     }
@@ -189,6 +190,7 @@ export class TransportServer {
     });
 
     const envelope = this.pairingService.encryptEnvelope(workerDeviceId, taskPayload);
+    Logger.transport(`EXECUTE_TASK sent: ${task.id} -> ${workerDeviceId}`);
     ws.send(JSON.stringify({
       type: 'EXECUTE_TASK',
       taskId: task.id,
@@ -230,6 +232,20 @@ export class TransportServer {
           capabilityProfile: msg.capabilityProfile
         });
         Logger.workerState(`DISCOVERED: ${deviceId}`);
+
+        const remoteAddr = (ws as any)._remoteAddress || '127.0.0.1';
+        const isLoopback = remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1' || remoteAddr === 'localhost';
+        if (isLoopback) {
+          Logger.handshake(`[LOCAL-WORKER] DISCOVERY_RECEIVED: ${deviceId}`);
+        }
+        if (isLoopback && !this.workerManager.getWorker(deviceId)) {
+          setImmediate(() => {
+            const initiation = this.pairingService.createPairingInitiation(deviceId);
+            Logger.pairing(`[LOCAL-WORKER] PAIRING_REQUEST_SENT: ${deviceId}`);
+            this.sendPairingRequest(deviceId, initiation);
+          });
+        }
+
         return { type: 'DISCOVERY_ACK', hostDeviceId: 'swarmx-host' };
       }
 
@@ -270,6 +286,7 @@ export class TransportServer {
         } = msg;
 
         Logger.pairing(`Pairing confirmation received for ${workerDeviceId} (SAS: ${confirmedSasCode})`);
+        Logger.pairing(`[LOCAL-WORKER] PAIRING_CONFIRMED: ${workerDeviceId}`);
 
         let session;
         try {
@@ -292,6 +309,7 @@ export class TransportServer {
           try {
             this.workerManager.registerWorker(capabilityProfile);
             Logger.registration(`Worker registered: ${workerDeviceId}`);
+            Logger.registration(`[LOCAL-WORKER] REGISTERED: ${workerDeviceId}`);
           } catch (err: any) {
             Logger.error(`Worker capability registration failed for ${workerDeviceId}: ${err.message}`);
             Logger.workerState(`REJECTED: ${workerDeviceId}`);
@@ -340,6 +358,9 @@ export class TransportServer {
           `Thermal=${telemetry.thermalState}, ` +
           `CPU=${Math.round(telemetry.cpuUtilization * 100)}%)`
         );
+        if (workerState.isEligible) {
+          Logger.workerState(`[LOCAL-WORKER] READY: ${telemetry.deviceId}`);
+        }
         
         // Heartbeat renewal: Extends lease on all in-flight tasks assigned to this active worker
         this.taskStore.renewWorkerLeases(telemetry.deviceId);
@@ -362,6 +383,7 @@ export class TransportServer {
         const resultPayload = JSON.parse(decryptedBytes.toString('utf-8'));
         const workerHost = resultPayload.workerHostname || msg.workerDeviceId;
         const workerPidStr = resultPayload.workerPid ? ` (PID=${resultPayload.workerPid})` : '';
+        Logger.transport(`TASK_RESULT received: ${resultPayload.taskId || msg.taskId} from ${workerHost}`);
         Logger.execution(`Result received for task ${resultPayload.taskId || msg.taskId} from ${workerHost}${workerPidStr} in ${resultPayload.executionTimeMs || 0}ms`);
         
         let processingResult = null;

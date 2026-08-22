@@ -65,12 +65,15 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
           vscode.commands.executeCommand('swarmx.restartCore');
           break;
         case 'startWorker':
+        case 'startLocalWorker':
           vscode.commands.executeCommand('swarmx.startLocalWorker');
           break;
         case 'stopWorker':
+        case 'stopLocalWorker':
           vscode.commands.executeCommand('swarmx.stopLocalWorker');
           break;
         case 'restartWorker':
+        case 'restartLocalWorker':
           vscode.commands.executeCommand('swarmx.restartLocalWorker');
           break;
         case 'toggleWorkspace':
@@ -221,6 +224,7 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
     const allWorkloads = state.recentWorkloads || [];
     const lastWkl = allWorkloads.length > 0 ? allWorkloads[allWorkloads.length - 1] : null;
     const isMatmul = lastWkl?.kernelId === 'matrix_multiply_v1' || (lastWkl?.workloadId && lastWkl.workloadId.includes('matmul'));
+    const isVideo = lastWkl?.kernelId === 'video_frame_analysis_v1' || (lastWkl?.workloadId && lastWkl.workloadId.includes('video'));
 
     let kernelDisplayName = '2D BoxBlur (image_filter_box_blur_v1)';
     let workloadShapeStr = '1024 × 1024 (RGBA)';
@@ -231,6 +235,13 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
       const K = p?.K || 512;
       const N = p?.N || 512;
       workloadShapeStr = `${M} × ${K} × ${N}`;
+    } else if (isVideo) {
+      kernelDisplayName = 'Distributed Video Analysis (video_frame_analysis_v1)';
+      const p = lastWkl?.parameters;
+      const tf = p?.totalFrames || lastWkl?.totalFrames || 900;
+      const w = p?.width || 512;
+      const h = p?.height || 512;
+      workloadShapeStr = `${tf} Frames (${w} × ${h} RGBA)`;
     }
 
     const currentWklId = lastWkl ? (lastWkl.workloadId || lastWkl.taskId) : 'None (IDLE)';
@@ -248,14 +259,40 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
     const progressPct = totalChunks > 0 ? Math.min(100, Math.round((completedChunks / totalChunks) * 100)) : 0;
 
     // Dynamic Chunk Distribution across all nodes
-    const localHostDistributed = allWorkloads.filter((w: any) => w.localVsRemote === 'LOCAL' || w.workerId === 'local-host').length;
+    const workerNameMap = new Map<string, string>();
+    for (const cw of (state.connectedWorkers || [])) {
+      if (cw.deviceId) {
+        workerNameMap.set(cw.deviceId, cw.capabilityProfile?.deviceName || cw.deviceName || cw.deviceId);
+      }
+    }
+
+    let localHostDistributed = 0;
     const simWorkerDistributed = allWorkloads.filter((w: any) => w.workerId === 'sim-worker-virtual-m3').length;
-    
-    // Build per-worker chunk counts
     const workerChunkCounts = new Map<string, number>();
-    for (const w of allWorkloads) {
-      if (w.workerHostname && w.workerHostname !== 'Local Host') {
-        workerChunkCounts.set(w.workerHostname, (workerChunkCounts.get(w.workerHostname) || 0) + 1);
+
+    // Priority: If the last workload contains explicit chunkDistribution telemetry, use it for current execution distribution
+    const chunkDist = lastWkl?.telemetry?.chunkDistribution || lastWkl?.chunkDistribution || lastWkl?.parameters?.chunkDistribution;
+
+    if (Array.isArray(chunkDist) && chunkDist.length > 0) {
+      for (const chunk of chunkDist) {
+        const wId = chunk.workerId || '';
+        const resolvedName = workerNameMap.get(wId) || chunk.workerHostname || wId;
+        if (wId === 'local-host' || resolvedName === 'Local Host') {
+          localHostDistributed++;
+        } else if (resolvedName) {
+          workerChunkCounts.set(resolvedName, (workerChunkCounts.get(resolvedName) || 0) + 1);
+        }
+      }
+    } else {
+      // Fallback for non-chunked or legacy workloads
+      localHostDistributed = allWorkloads.filter((w: any) => w.localVsRemote === 'LOCAL' || w.workerId === 'local-host').length;
+      for (const w of allWorkloads) {
+        if (w.workerHostname && w.workerHostname !== 'Local Host' && !w.workerHostname.includes('Swarm Nodes')) {
+          workerChunkCounts.set(w.workerHostname, (workerChunkCounts.get(w.workerHostname) || 0) + 1);
+        } else if (w.workerId && w.workerId !== 'multi-worker-swarm' && w.workerId !== 'local-host') {
+          const resolved = workerNameMap.get(w.workerId) || w.workerId;
+          workerChunkCounts.set(resolved, (workerChunkCounts.get(resolved) || 0) + 1);
+        }
       }
     }
 
@@ -265,10 +302,10 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
     }
     for (const [wName, count] of workerChunkCounts.entries()) {
       if (!wName.includes('Virtual') && !wName.includes('Local Host')) {
-        distributionStr += ` | ${wName}: ${count}`;
+        distributionStr += ` | ${this.escapeHtml(wName)}: ${count}`;
       }
     }
-    if (workerChunkCounts.size === 0 && !isSimulated) {
+    if (workerChunkCounts.size === 0 && !isSimulated && localHostDistributed === 0 && allWorkloads.length > 0) {
       distributionStr += ` | Swarm: ${allWorkloads.filter((w: any) => w.localVsRemote === 'REMOTE').length}`;
     }
 
@@ -352,16 +389,32 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
     }
 
     // Compact live chunk activity HTML
-    const chunkActivityHtml = allWorkloads.slice(-8).map((w: any, idx: number) => {
-      const chkLabel = w.taskId && w.taskId.includes('chunk') ? w.taskId.split('-').slice(-2).join('-') : `Chunk ${String(idx).padStart(2, '0')}`;
-      const statusBadge = w.status === 'COMPLETE' ? '<span class="badge ready">COMPLETE ✓</span>' : (w.status === 'FAILED' ? '<span class="badge offline">RETRYING ⟳</span>' : '<span class="badge demo">RUNNING</span>');
-      return `
+    let chunkActivityHtml = '';
+    const activeChunkDist = lastWkl?.telemetry?.chunkDistribution || lastWkl?.chunkDistribution;
+    if (Array.isArray(activeChunkDist) && activeChunkDist.length > 0) {
+      chunkActivityHtml = activeChunkDist.map((c: any) => {
+        const chkLabel = `Chunk ${String(c.chunkIndex !== undefined ? c.chunkIndex : 0).padStart(2, '0')}`;
+        const resolvedWorker = workerNameMap.get(c.workerId) || c.workerHostname || c.workerId || 'Swarm Node';
+        const execTimeStr = c.executionTimeMs ? ` (${Math.round(c.executionTimeMs)}ms)` : '';
+        return `
+        <div class="row" style="font-size: 10px; border-bottom: 1px dashed rgba(255,255,255,0.04); padding-bottom: 2px; margin-bottom: 3px;">
+          <span class="row-label"><code>${chkLabel}</code> → 🍏 ${this.escapeHtml(resolvedWorker)}${execTimeStr}</span>
+          <span class="row-val"><span class="badge ready">COMPLETE ✓</span></span>
+        </div>
+      `;
+      }).join('');
+    } else {
+      chunkActivityHtml = allWorkloads.slice(-8).map((w: any, idx: number) => {
+        const chkLabel = w.taskId && w.taskId.includes('chunk') ? w.taskId.split('-').slice(-2).join('-') : `Chunk ${String(idx).padStart(2, '0')}`;
+        const statusBadge = w.status === 'COMPLETE' ? '<span class="badge ready">COMPLETE ✓</span>' : (w.status === 'FAILED' ? '<span class="badge offline">RETRYING ⟳</span>' : '<span class="badge demo">RUNNING</span>');
+        return `
         <div class="row" style="font-size: 10px; border-bottom: 1px dashed rgba(255,255,255,0.04); padding-bottom: 2px; margin-bottom: 3px;">
           <span class="row-label"><code>${chkLabel}</code> → ${this.escapeHtml(w.workerHostname || 'Worker')}</span>
           <span class="row-val">${statusBadge}</span>
         </div>
       `;
-    }).join('');
+      }).join('');
+    }
 
     // Workload logs
     let logsHtml = (state.recentLogs || []).map((l: string) => `<div class="log-line">${this.escapeHtml(l)}</div>`).join('');

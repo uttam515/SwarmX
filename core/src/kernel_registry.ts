@@ -57,6 +57,20 @@ export class KernelRegistry {
       supportedPlatforms: ['darwin', 'windows', 'linux'],
       estimatedComplexityFlopsPerByte: 128.0
     });
+
+    // Phase 6 Certified Flagship Kernel: Video Frame Analysis (Luminance, Edge Gradient, and Motion Energy)
+    this.registerKernel({
+      kernelId: 'video_frame_analysis_v1',
+      version: '1.0.0',
+      domain: 'IMAGE_PROCESSING',
+      description: 'Multi-frame sequential luminance, gradient edge density, blur score, and motion energy analysis',
+      inputFormat: 'RAW_PLANAR_RGBA_UINT8',
+      outputFormat: 'JSON_METADATA_ARRAY',
+      minBeneficialBytes: 65536,
+      defaultToleranceValidator: 'NUMERIC_TOLERANCE',
+      supportedPlatforms: ['darwin', 'windows', 'linux'],
+      estimatedComplexityFlopsPerByte: 32.0
+    });
   }
 
   public registerKernel(kernel: KernelDefinition): void {

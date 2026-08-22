@@ -14,7 +14,7 @@ import { BINARY_FRAME_MAGIC, encodeBinaryFrame, decodeBinaryFrame } from './bina
 import { Task, TaskStatus, WorkloadDescriptor } from './types';
 import { Logger } from './logger';
 import { SimulationWorkerAdapter } from './simulation_worker';
-import { MatrixChunkEngine, MatrixChunkSpec, MatrixChunkResult } from './chunk_engine';
+import { MatrixChunkEngine, MatrixChunkSpec, MatrixChunkResult, ImageChunkEngine, ImageChunkSpec, ImageChunkResult, VideoChunkEngine, VideoChunkSpec, VideoChunkResult } from './chunk_engine';
 import { ToleranceAwareMatrixValidator } from './result_validator';
 
 export interface IpcMessage {
@@ -140,8 +140,10 @@ export class IpcServer {
           this.activeSockets.delete(socket);
         });
 
-        let rawBuffer = Buffer.alloc(0);
+        let chunkList: Buffer[] = [];
+        let totalBufferedBytes = 0;
         let processing = false;
+        let t_ingest_start = 0;
 
         const processBuffer = async () => {
           if (processing) return;
@@ -149,17 +151,74 @@ export class IpcServer {
 
           try {
             while (true) {
+              if (totalBufferedBytes === 0) break;
+
+              let firstChunk = chunkList[0];
+              if (firstChunk.length < 8 && totalBufferedBytes >= 8) {
+                chunkList = [Buffer.concat(chunkList)];
+                firstChunk = chunkList[0];
+              }
+
               // 1. Check for Binary Frame Magic ('SWRM' = 0x5357524D)
-              if (rawBuffer.length >= 4 && rawBuffer.readUInt32BE(0) === BINARY_FRAME_MAGIC) {
-                const decoded = decodeBinaryFrame(rawBuffer);
-                if (!decoded) break;
+              if (totalBufferedBytes >= 4 && firstChunk.readUInt32BE(0) === BINARY_FRAME_MAGIC) {
+                if (totalBufferedBytes < 8) break;
 
-                rawBuffer = rawBuffer.subarray(decoded.totalLength);
+                const jsonLen = firstChunk.readUInt32BE(4);
+                if (totalBufferedBytes < 8 + jsonLen) break;
 
-                const msg = decoded.metadata;
-                // Pass raw binary payload directly into workload data without redundant Base64 conversion
+                let headerBuf: Buffer;
+                if (firstChunk.length >= 8 + jsonLen) {
+                  headerBuf = firstChunk;
+                } else {
+                  const merged = Buffer.concat(chunkList);
+                  chunkList = [merged];
+                  headerBuf = merged;
+                }
+
+                const jsonStr = headerBuf.toString('utf-8', 8, 8 + jsonLen);
+                let metadata: any;
+                try {
+                  metadata = JSON.parse(jsonStr);
+                } catch (err) {
+                  throw new Error(`Malformed binary frame metadata: ${err}`);
+                }
+
+                const declaredPayload =
+                  metadata?.totalPayloadBytes ??
+                  metadata?.result?.totalPayloadBytes ??
+                  metadata?.params?.workload?.data?.totalPayloadBytes ??
+                  metadata?.params?.workload?.totalPayloadBytes ??
+                  metadata?.params?.totalPayloadBytes ??
+                  metadata?.workload?.data?.totalPayloadBytes ??
+                  metadata?.data?.totalPayloadBytes ?? 0;
+
+                const requiredFrameSize = 8 + jsonLen + declaredPayload;
+                if (totalBufferedBytes < requiredFrameSize) {
+                  break; // Wait for complete frame
+                }
+
+                const completeBuffer = chunkList.length === 1 ? chunkList[0] : Buffer.concat(chunkList, totalBufferedBytes);
+                const framePayload = completeBuffer.subarray(8 + jsonLen, requiredFrameSize);
+
+                if (totalBufferedBytes > requiredFrameSize) {
+                  const leftover = completeBuffer.subarray(requiredFrameSize);
+                  chunkList = [leftover];
+                  totalBufferedBytes = leftover.length;
+                } else {
+                  chunkList = [];
+                  totalBufferedBytes = 0;
+                }
+
+                const ingestElapsedMs = t_ingest_start > 0 ? (performance.now() - t_ingest_start) : 0;
+                const payloadMb = (declaredPayload / (1024 * 1024)).toFixed(2);
+                if (declaredPayload >= 1024 * 1024) {
+                  Logger.execution(`[PAYLOAD] Incoming binary payload: ${payloadMb} MB`);
+                  Logger.execution(`[PAYLOAD] Binary ingestion completed in ${ingestElapsedMs.toFixed(1)} ms`);
+                }
+
+                const msg = metadata;
                 if (msg.params?.workload?.data) {
-                  msg.params.workload.data.rawPayloadBuffer = decoded.payload;
+                  msg.params.workload.data.rawPayloadBuffer = framePayload;
                 }
 
                 try {
@@ -179,14 +238,23 @@ export class IpcServer {
                   const errFrame = encodeBinaryFrame({ id: msg.id || null, error: err.message }, Buffer.alloc(0));
                   socket.write(errFrame);
                 }
-              } else if (rawBuffer.length > 0) {
+              } else if (totalBufferedBytes > 0) {
                 // 2. Legacy JSON-RPC Line Protocol
-                const text = rawBuffer.toString('utf-8');
+                const textBuf = chunkList.length === 1 ? chunkList[0] : Buffer.concat(chunkList, totalBufferedBytes);
+                const text = textBuf.toString('utf-8');
                 const newlineIdx = text.indexOf('\n');
                 if (newlineIdx === -1) break;
 
                 const line = text.slice(0, newlineIdx).trim();
-                rawBuffer = rawBuffer.subarray(Buffer.byteLength(text.slice(0, newlineIdx + 1), 'utf-8'));
+                const consumedBytes = Buffer.byteLength(text.slice(0, newlineIdx + 1), 'utf-8');
+                if (totalBufferedBytes > consumedBytes) {
+                  const leftover = textBuf.subarray(consumedBytes);
+                  chunkList = [leftover];
+                  totalBufferedBytes = leftover.length;
+                } else {
+                  chunkList = [];
+                  totalBufferedBytes = 0;
+                }
 
                 if (line) {
                   try {
@@ -205,7 +273,8 @@ export class IpcServer {
               }
             }
           } catch (err: any) {
-            rawBuffer = Buffer.alloc(0);
+            chunkList = [];
+            totalBufferedBytes = 0;
             const errFrame = encodeBinaryFrame({ id: null, error: `BINARY_FRAME_ERROR: ${err.message}` }, Buffer.alloc(0));
             socket.write(errFrame);
           } finally {
@@ -214,7 +283,11 @@ export class IpcServer {
         };
 
         socket.on('data', (chunk) => {
-          rawBuffer = Buffer.concat([rawBuffer, chunk]);
+          if (totalBufferedBytes === 0) {
+            t_ingest_start = performance.now();
+          }
+          chunkList.push(chunk);
+          totalBufferedBytes += chunk.length;
           processBuffer();
         });
       });
@@ -474,19 +547,33 @@ export class IpcServer {
             };
           }
 
-          // 2. Check if workload is eligible for Multi-Chunk Distributed GEMM
+          // 2. Check if workload is eligible for Multi-Chunk Distributed GEMM, Image Filter, or Video Analysis
           const isMatmul = workload.computation.kernelId === 'matrix_multiply_v1';
-          const matmulParams = (workload.computation.parameters || {}) as any;
-          const M = Number(matmulParams.M || 0);
-          const K = Number(matmulParams.K || 0);
-          const N = Number(matmulParams.N || 0);
-          const requestedChunks = Number(matmulParams.chunks || matmulParams.chunkCount || 0);
+          const isBoxBlur = workload.computation.kernelId === 'image_filter_box_blur_v1';
+          const isVideo = workload.computation.kernelId === 'video_frame_analysis_v1';
+          const params = (workload.computation.parameters || {}) as any;
+          const M = Number(params.M || 0);
+          const K = Number(params.K || 0);
+          const N = Number(params.N || 0);
+          const imgWidth = Number(params.width || 0);
+          const imgHeight = Number(params.height || 0);
+          const totalFrames = Number(params.totalFrames || params.frameCount || params.frames || 0);
+          const requestedChunks = Number(params.chunks || params.chunkCount || 0);
           const connectedRealCount = this.workerManager.listWorkers().filter(w => w.isEligible).length;
           const simActive = this.simulationWorker.isEnabled;
-          const shouldChunk = isMatmul && M >= 64 && K > 0 && N > 0 && (requestedChunks > 1 || (connectedRealCount > 1 && workload.data.totalPayloadBytes >= 64 * 1024) || (simActive && requestedChunks > 1));
 
-          if (shouldChunk) {
+          const shouldChunkMatMul = isMatmul && M >= 64 && K > 0 && N > 0 && (requestedChunks > 1 || (connectedRealCount > 1 && workload.data.totalPayloadBytes >= 64 * 1024) || (simActive && requestedChunks > 1));
+          const shouldChunkImage = isBoxBlur && imgWidth >= 64 && imgHeight >= 64 && (requestedChunks > 1 || (connectedRealCount > 1 && workload.data.totalPayloadBytes >= 64 * 1024) || (simActive && requestedChunks > 1));
+          const shouldChunkVideo = isVideo && (totalFrames > 1 || requestedChunks > 1 || isForceSwarm || connectedRealCount >= 1 || simActive);
+
+          if (shouldChunkMatMul) {
             return await this.executeChunkedMatMul(msg, workload, isForceSwarm, decision, t_decision_ms);
+          }
+          if (shouldChunkImage) {
+            return await this.executeChunkedImageFilter(msg, workload, isForceSwarm, decision, t_decision_ms);
+          }
+          if (shouldChunkVideo) {
+            return await this.executeChunkedVideoAnalysis(msg, workload, isForceSwarm, decision, t_decision_ms);
           }
 
           // 3. Create Task in TaskStore for Single-Task Execution Path
@@ -534,16 +621,22 @@ export class IpcServer {
             };
           }
 
-          Logger.execution(`Selected remote worker: ${workerId} (${hostName})`);
-          this.taskStore.assignTask(task.id, workerId, 30000);
+          const payloadBytes = workload.data.totalPayloadBytes || (
+            (workload.data as any).rawPayloadBuffer ? (workload.data as any).rawPayloadBuffer.length : 0
+          );
+          const envTimeoutMs = process.env.SWARMX_WORKLOAD_TIMEOUT_MS ? parseInt(process.env.SWARMX_WORKLOAD_TIMEOUT_MS, 10) : 0;
+          const dynamicWorkloadTimeoutMs = envTimeoutMs > 0 ? envTimeoutMs : Math.max(30000, 30000 + Math.round((payloadBytes / (1024 * 1024)) * 1500));
+
+          Logger.execution(`Selected remote worker: ${workerId} (${hostName}) [Lease: ${(dynamicWorkloadTimeoutMs / 1000).toFixed(0)}s]`);
+          this.taskStore.assignTask(task.id, workerId, dynamicWorkloadTimeoutMs);
           this.decisionEngine.acquireReservation(workerId);
 
           try {
             // 4. Await completion from WorkloadPipeline with timeout
             const completionPromise = new Promise<any>((resolve) => {
               const timeoutTimer = setTimeout(() => {
-                resolve({ status: 'TIMEOUT', error: 'Workload execution timed out after 30s' });
-              }, 30000);
+                resolve({ status: 'TIMEOUT', error: `Workload execution timed out after ${(dynamicWorkloadTimeoutMs / 1000).toFixed(0)}s` });
+              }, dynamicWorkloadTimeoutMs);
 
               if (this.workloadPipeline) {
                 this.workloadPipeline.onTaskFinished(task.id, (res: any) => {
@@ -877,6 +970,7 @@ export class IpcServer {
       const t_scheduling_ms = performance.now() - t_sched_start;
 
       const chunkResults = await Promise.all(chunkPromises);
+      Logger.execution(`[PAYLOAD] Result received: All ${chunkResults.length} chunks completed`);
 
       const t_reasm_start = performance.now();
       const assembledBuffer = MatrixChunkEngine.assembleMatrixChunks(
@@ -887,6 +981,7 @@ export class IpcServer {
         chunkResults
       );
       const t_reassembly_ms = performance.now() - t_reasm_start;
+      Logger.execution(`[PAYLOAD] Reassembly completed in ${t_reassembly_ms.toFixed(1)} ms`);
 
       const t_val_start = performance.now();
       const validator = new ToleranceAwareMatrixValidator();
@@ -1057,15 +1152,21 @@ export class IpcServer {
         throw new Error(`Scheduler could not place chunk ${spec.metadata.chunkIndex} (attempt ${attempt + 1}/${maxRetries + 1}): ${scheduleResult.status}`);
       }
 
-      this.taskStore.assignTask(chunkTaskId, targetWorkerId, 30000);
+      const payloadBytes = spec.payload.length;
+      const envTimeoutMs = process.env.SWARMX_WORKLOAD_TIMEOUT_MS ? parseInt(process.env.SWARMX_WORKLOAD_TIMEOUT_MS, 10) : 0;
+      const dynamicChunkTimeoutMs = envTimeoutMs > 0 ? envTimeoutMs : Math.max(30000, 30000 + Math.round((payloadBytes / (1024 * 1024)) * 1500));
+
+      this.taskStore.assignTask(chunkTaskId, targetWorkerId, dynamicChunkTimeoutMs);
       this.decisionEngine.acquireReservation(targetWorkerId);
+
+      Logger.execution(`[PAYLOAD] Dispatching chunk ${spec.metadata.chunkIndex + 1}/${spec.metadata.totalChunks} (${(payloadBytes / (1024 * 1024)).toFixed(2)} MB) to ${targetWorkerId}`);
 
       try {
         const chunkStartMs = Date.now();
         const completionPromise = new Promise<any>((resolve) => {
           const timer = setTimeout(() => {
-            resolve({ status: 'TIMEOUT', error: `Chunk ${spec.metadata.chunkIndex} timed out after 30s` });
-          }, 30000);
+            resolve({ status: 'TIMEOUT', error: `Chunk ${spec.metadata.chunkIndex} timed out after ${(dynamicChunkTimeoutMs / 1000).toFixed(0)}s` });
+          }, dynamicChunkTimeoutMs);
 
           if (this.workloadPipeline) {
             this.workloadPipeline.onTaskFinished(chunkTaskId, (res) => {
@@ -1137,6 +1238,646 @@ export class IpcServer {
     }
 
     throw new Error(`Chunk ${spec.metadata.chunkIndex} failed after ${maxRetries + 1} attempts: ${lastError}`);
+  }
+
+  private async executeChunkedImageFilter(
+    msg: IpcMessage,
+    workload: WorkloadDescriptor,
+    isForceSwarm: boolean,
+    decision: any,
+    t_decision_ms: number = 0
+  ): Promise<IpcResponse> {
+    const parentWorkloadId = workload.workloadId || `wkl-boxblur-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+    const params = (workload.computation.parameters || {}) as any;
+    const width = Number(params.width || 0);
+    const height = Number(params.height || 0);
+    const radius = Number(params.radius || 2);
+    const mode = String(params.mode || 'RGBA');
+    const channels = mode === 'RGB' ? 3 : (mode === 'L' ? 1 : 4);
+    const batchId = params.batchId || (workload as any).batchId;
+
+    const rawPayload: Buffer = (workload.data as any).rawPayloadBuffer
+      ? (workload.data as any).rawPayloadBuffer
+      : Buffer.from(workload.data.payloadBase64 || '', 'base64');
+
+    const connectedWorkers = this.workerManager.listWorkers().filter(w => w.isEligible);
+    const simActive = this.simulationWorker.isEnabled;
+    const effectiveWorkerCount = connectedWorkers.length + (simActive ? 1 : 0);
+    const requestedChunks = Number(params.chunks || params.chunkCount || 0);
+    const numChunks = Math.min(requestedChunks > 0 ? requestedChunks : Math.max(2, effectiveWorkerCount), height);
+
+    const t_chunk_start = performance.now();
+    const chunkSpecs = ImageChunkEngine.partitionImageFilter(
+      parentWorkloadId,
+      width,
+      height,
+      channels,
+      mode,
+      radius,
+      numChunks,
+      rawPayload
+    );
+    const t_chunking_ms = performance.now() - t_chunk_start;
+
+    if (this.workloadPipeline) {
+      this.workloadPipeline.registerWorkload(parentWorkloadId, chunkSpecs.length);
+    }
+
+    const t_workload_start = performance.now();
+    const startTimeMs = Date.now();
+    Logger.execution(`Partitioned image workload ${parentWorkloadId} (${width}x${height} ${mode}, radius=${radius}) into ${chunkSpecs.length} parallel chunks`);
+
+    this.recordWorkloadEvent({
+      workloadId: parentWorkloadId,
+      taskId: parentWorkloadId,
+      workerId: simActive ? SimulationWorkerAdapter.DEVICE_ID : 'multi-worker-swarm',
+      workerHostname: simActive ? '🧪 Virtual Apple Silicon Worker' : `${numChunks} Swarm Nodes`,
+      status: 'RUNNING',
+      startTimeMs,
+      kernelId: 'image_filter_box_blur_v1',
+      batchId,
+      decision: decision.decision,
+      estimatedLocalTimeMs: decision.estimatedLocalTimeMs,
+      estimatedSwarmTimeMs: decision.estimatedSwarmTimeMs,
+      estimatedQueueTimeMs: decision.estimatedQueueTimeMs,
+      estimatedTransferTimeMs: decision.estimatedTransferTimeMs,
+      estimatedComputeTimeMs: decision.estimatedComputeTimeMs,
+      estimatedGain: decision.estimatedGain,
+      decisionReason: decision.reason,
+      isForceSwarm,
+      inputBytes: workload.data.totalPayloadBytes,
+      parameters: { ...params, totalChunks: chunkSpecs.length }
+    });
+
+    try {
+      const t_sched_start = performance.now();
+      const chunkPromises = chunkSpecs.map(spec => this.dispatchImageChunkWithRetry(spec, workload, isForceSwarm));
+      const t_scheduling_ms = performance.now() - t_sched_start;
+
+      const chunkResults = await Promise.all(chunkPromises);
+      Logger.execution(`[PAYLOAD] Result received: All ${chunkResults.length} image chunks completed`);
+
+      const t_reasm_start = performance.now();
+      const assembledBuffer = ImageChunkEngine.assembleImageChunks(
+        parentWorkloadId,
+        width,
+        height,
+        channels,
+        chunkResults
+      );
+      const t_reassembly_ms = performance.now() - t_reasm_start;
+      Logger.execution(`[PAYLOAD] Image reassembly completed in ${t_reassembly_ms.toFixed(1)} ms`);
+
+      const t_val_start = performance.now();
+      if (assembledBuffer.length !== width * height * channels) {
+        throw new Error(`Assembled image byte length mismatch: expected ${width * height * channels}, got ${assembledBuffer.length}`);
+      }
+      const t_validation_ms = performance.now() - t_val_start;
+
+      const t_total_ms = performance.now() - t_workload_start;
+      const maxComputeMs = Math.max(...chunkResults.map(r => r.executionTimeMs || 0));
+      const avgComputeMs = chunkResults.reduce((sum, r) => sum + (r.executionTimeMs || 0), 0) / chunkResults.length;
+
+      this.recordWorkloadEvent({
+        workloadId: parentWorkloadId,
+        taskId: parentWorkloadId,
+        workerId: simActive ? SimulationWorkerAdapter.DEVICE_ID : 'multi-worker-swarm',
+        workerHostname: simActive ? '🧪 Virtual Apple Silicon Worker' : `${numChunks} Swarm Nodes`,
+        status: 'COMPLETE',
+        startTimeMs,
+        endTimeMs: Date.now(),
+        durationSeconds: t_total_ms / 1000,
+        workerComputeTimeMs: Math.round(avgComputeMs),
+        transferTimeMs: Math.max(0, t_total_ms - maxComputeMs),
+        queueTimeMs: 0.0,
+        validationTimeMs: t_validation_ms,
+        localVsRemote: 'REMOTE',
+        kernelId: 'image_filter_box_blur_v1',
+        batchId,
+        decision: decision.decision,
+        estimatedLocalTimeMs: decision.estimatedLocalTimeMs,
+        estimatedSwarmTimeMs: decision.estimatedSwarmTimeMs,
+        estimatedQueueTimeMs: decision.estimatedQueueTimeMs,
+        estimatedTransferTimeMs: decision.estimatedTransferTimeMs,
+        estimatedComputeTimeMs: decision.estimatedComputeTimeMs,
+        estimatedGain: decision.estimatedGain,
+        decisionReason: decision.reason,
+        isForceSwarm,
+        inputBytes: workload.data.totalPayloadBytes,
+        parameters: { ...params, totalChunks: chunkSpecs.length }
+      });
+
+      const isBinaryFrameRequest = Boolean((workload.data as any).rawPayloadBuffer);
+      return {
+        id: msg.id,
+        result: {
+          status: 'COMPLETED',
+          taskId: parentWorkloadId,
+          workloadId: parentWorkloadId,
+          outputData: isBinaryFrameRequest ? assembledBuffer : assembledBuffer.toString('base64'),
+          totalChunks: chunkSpecs.length,
+          completedChunks: chunkSpecs.length,
+          telemetry: {
+            decisionMs: t_decision_ms,
+            chunkingMs: t_chunking_ms,
+            schedulingMs: t_scheduling_ms,
+            workerComputeMs: Math.round(avgComputeMs),
+            transferMs: Math.max(0, Math.round(t_total_ms - maxComputeMs)),
+            reassemblyMs: t_reassembly_ms,
+            validationMs: t_validation_ms,
+            coreTotalMs: t_total_ms + t_decision_ms,
+            chunkDistribution: chunkResults.map(r => ({
+              chunkIndex: r.chunkIndex,
+              workerId: r.workerId,
+              executionTimeMs: r.executionTimeMs
+            }))
+          }
+        }
+      };
+    } catch (err: any) {
+      Logger.error(`Chunked image execution failed for ${parentWorkloadId}: ${err.message}`);
+      return {
+        id: msg.id,
+        result: {
+          status: isForceSwarm ? 'FAILED' : 'LOCAL_FALLBACK',
+          taskId: parentWorkloadId,
+          workloadId: parentWorkloadId,
+          reason: `Chunked execution error: ${err.message}`
+        }
+      };
+    }
+  }
+
+  private async dispatchImageChunkWithRetry(
+    spec: ImageChunkSpec,
+    parentWorkload: WorkloadDescriptor,
+    isForceSwarm: boolean = false,
+    maxRetries: number = 2
+  ): Promise<ImageChunkResult> {
+    const parentWorkloadId = parentWorkload.workloadId || 'wkl-image-parent';
+    const chunkTaskId = `${parentWorkloadId}-chunk-${String(spec.metadata.chunkIndex).padStart(2, '0')}`;
+
+    let task = this.taskStore.getTask(chunkTaskId);
+    if (!task) {
+      task = this.taskStore.createTask({
+        id: chunkTaskId,
+        inputRef: 'inline_chunk_payload',
+        computationDescriptor: JSON.stringify({
+          kernelId: 'image_filter_box_blur_v1',
+          parameters: {
+            width: spec.metadata.width,
+            height: spec.metadata.inRowCount,
+            radius: spec.metadata.radius,
+            mode: spec.metadata.mode,
+            channels: spec.metadata.channels,
+            chunkIndex: spec.metadata.chunkIndex,
+            totalChunks: spec.metadata.totalChunks
+          }
+        }),
+        requiredResources: { minCpuCores: 1, minRamMb: 64 },
+        dependencies: [],
+        executionConstraints: { parentWorkloadId },
+        resultDestination: 'memory',
+        status: TaskStatus.PENDING
+      });
+    }
+
+    if (this.workloadPipeline) {
+      this.workloadPipeline.trackTaskInWorkload(parentWorkloadId, chunkTaskId);
+    }
+
+    let lastError = 'No eligible worker found';
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      const allWorkers = this.workerManager.listWorkers();
+      const scheduleResult = this.scheduler
+        ? this.scheduler.scheduleTask(task, allWorkers, this.taskStore)
+        : { status: 'NO_ELIGIBLE_WORKER', selectedWorker: undefined };
+
+      let targetWorkerId: string | null = null;
+
+      if (scheduleResult.status === 'ASSIGNED' && scheduleResult.selectedWorker) {
+        targetWorkerId = scheduleResult.selectedWorker.deviceId;
+      } else if (this.simulationWorker.isEnabled) {
+        targetWorkerId = SimulationWorkerAdapter.DEVICE_ID;
+      }
+
+      if (!targetWorkerId) {
+        throw new Error(`Scheduler could not place image chunk ${spec.metadata.chunkIndex} (attempt ${attempt + 1}/${maxRetries + 1}): ${scheduleResult.status}`);
+      }
+
+      const payloadBytes = spec.payload.length;
+      const envTimeoutMs = process.env.SWARMX_WORKLOAD_TIMEOUT_MS ? parseInt(process.env.SWARMX_WORKLOAD_TIMEOUT_MS, 10) : 0;
+      const dynamicChunkTimeoutMs = envTimeoutMs > 0 ? envTimeoutMs : Math.max(30000, 30000 + Math.round((payloadBytes / (1024 * 1024)) * 1500));
+
+      this.taskStore.assignTask(chunkTaskId, targetWorkerId, dynamicChunkTimeoutMs);
+      this.decisionEngine.acquireReservation(targetWorkerId);
+
+      Logger.execution(`[PAYLOAD] Dispatching image chunk ${spec.metadata.chunkIndex + 1}/${spec.metadata.totalChunks} (${(payloadBytes / (1024 * 1024)).toFixed(2)} MB) to ${targetWorkerId}`);
+
+      try {
+        const chunkStartMs = Date.now();
+        const completionPromise = new Promise<any>((resolve) => {
+          const timer = setTimeout(() => {
+            resolve({ status: 'TIMEOUT', error: `Image chunk ${spec.metadata.chunkIndex} timed out after ${(dynamicChunkTimeoutMs / 1000).toFixed(0)}s` });
+          }, dynamicChunkTimeoutMs);
+
+          if (this.workloadPipeline) {
+            this.workloadPipeline.onTaskFinished(chunkTaskId, (res) => {
+              clearTimeout(timer);
+              resolve({
+                success: res.success,
+                status: res.success ? 'COMPLETED' : 'FAILED',
+                outputData: res.outputData || (res.task ? res.task.resultDestination : ''),
+                error: res.error,
+                executionTimeMs: res.executionTimeMs || (Date.now() - chunkStartMs)
+              });
+            });
+          } else {
+            clearTimeout(timer);
+            resolve({ success: true, status: 'COMPLETED', outputData: '' });
+          }
+        });
+
+        task.assignedWorkerId = targetWorkerId;
+        if (targetWorkerId === SimulationWorkerAdapter.DEVICE_ID || targetWorkerId.startsWith('sim-worker-virtual-')) {
+          this.simulationWorker.executeTask(task, spec.payload, 1)
+            .then(async (simRes) => {
+              if (this.workloadPipeline) {
+                await this.workloadPipeline.handleTaskResult(simRes);
+              }
+            })
+            .catch((err) => {
+              this.taskStore.recordTaskFailure(chunkTaskId, targetWorkerId!, 'SIMULATION_ERROR', { error: err.message });
+            });
+        } else {
+          const payloadBase64 = spec.payload.toString('base64');
+          const sent = this.transportServer.sendExecuteTask(
+            targetWorkerId,
+            task,
+            payloadBase64,
+            1
+          );
+          if (!sent) {
+            this.taskStore.recordTaskFailure(chunkTaskId, targetWorkerId, 'TRANSPORT_SEND_FAILED', {});
+            throw new Error(`Failed to send image chunk ${spec.metadata.chunkIndex} to worker ${targetWorkerId}`);
+          }
+        }
+
+        const res = await completionPromise;
+        if (res.status === 'COMPLETED' && res.outputData) {
+          const outputBuf = Buffer.isBuffer(res.outputData) ? res.outputData : Buffer.from(res.outputData, 'base64');
+          return {
+            parentWorkloadId,
+            chunkIndex: spec.metadata.chunkIndex,
+            totalChunks: spec.metadata.totalChunks,
+            outRowStart: spec.metadata.outRowStart,
+            outRowEnd: spec.metadata.outRowEnd,
+            outRowCount: spec.metadata.outRowCount,
+            inRowStart: spec.metadata.inRowStart,
+            inRowEnd: spec.metadata.inRowEnd,
+            inRowCount: spec.metadata.inRowCount,
+            topHalo: spec.metadata.topHalo,
+            bottomHalo: spec.metadata.bottomHalo,
+            width: spec.metadata.width,
+            height: spec.metadata.height,
+            channels: spec.metadata.channels,
+            radius: spec.metadata.radius,
+            outputBuffer: outputBuf,
+            workerId: targetWorkerId,
+            executionTimeMs: res.executionTimeMs || (Date.now() - chunkStartMs)
+          };
+        } else {
+          lastError = res.error || `Image chunk ${spec.metadata.chunkIndex} execution failed on ${targetWorkerId}`;
+          this.taskStore.recordTaskFailure(chunkTaskId, targetWorkerId, 'EXECUTION_FAILED', { error: lastError });
+        }
+      } finally {
+        this.decisionEngine.releaseReservation(targetWorkerId);
+      }
+    }
+
+    throw new Error(`Image chunk ${spec.metadata.chunkIndex} failed after ${maxRetries + 1} attempts: ${lastError}`);
+  }
+
+  private async executeChunkedVideoAnalysis(
+    msg: IpcMessage,
+    workload: WorkloadDescriptor,
+    isForceSwarm: boolean,
+    decision: any,
+    t_decision_ms: number = 0
+  ): Promise<IpcResponse> {
+    const parentWorkloadId = workload.workloadId || `wkl-video-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+    const params = (workload.computation.parameters || {}) as any;
+    const width = Number(params.width || 512);
+    const height = Number(params.height || 512);
+    const totalFrames = Number(params.totalFrames || params.frameCount || params.frames || 30);
+    const chunkSize = Number(params.chunkSize || params.framesPerChunk || 30);
+    const mode = String(params.mode || 'RGBA');
+    const channels = mode === 'RGB' ? 3 : (mode === 'L' ? 1 : 4);
+    const batchId = params.batchId || (workload as any).batchId;
+
+    const rawPayload: Buffer = (workload.data as any).rawPayloadBuffer
+      ? (workload.data as any).rawPayloadBuffer
+      : Buffer.from(workload.data.payloadBase64 || '', 'base64');
+
+    const connectedWorkers = this.workerManager.listWorkers().filter(w => w.isEligible);
+    const simActive = this.simulationWorker.isEnabled;
+    const effectiveWorkerCount = connectedWorkers.length + (simActive ? 1 : 0);
+
+    const t_chunk_start = performance.now();
+    const chunkSpecs = VideoChunkEngine.partitionVideoFrames(
+      parentWorkloadId,
+      width,
+      height,
+      channels,
+      mode,
+      totalFrames,
+      chunkSize,
+      rawPayload
+    );
+    const t_chunking_ms = performance.now() - t_chunk_start;
+
+    if (this.workloadPipeline) {
+      this.workloadPipeline.registerWorkload(parentWorkloadId, chunkSpecs.length);
+    }
+
+    const t_workload_start = performance.now();
+    const startTimeMs = Date.now();
+    Logger.execution(`Partitioned video analysis ${parentWorkloadId} (${totalFrames} frames @ ${width}x${height}, chunkSize=${chunkSize}) into ${chunkSpecs.length} dynamic queue chunks across ${effectiveWorkerCount} workers`);
+
+    this.recordWorkloadEvent({
+      workloadId: parentWorkloadId,
+      taskId: parentWorkloadId,
+      workerId: simActive ? SimulationWorkerAdapter.DEVICE_ID : 'multi-worker-swarm',
+      workerHostname: simActive ? '🧪 Virtual Apple Silicon Worker' : `${effectiveWorkerCount} Swarm Nodes`,
+      status: 'RUNNING',
+      startTimeMs,
+      kernelId: 'video_frame_analysis_v1',
+      batchId,
+      decision: decision.decision,
+      estimatedLocalTimeMs: decision.estimatedLocalTimeMs,
+      estimatedSwarmTimeMs: decision.estimatedSwarmTimeMs,
+      estimatedQueueTimeMs: decision.estimatedQueueTimeMs,
+      estimatedTransferTimeMs: decision.estimatedTransferTimeMs,
+      estimatedComputeTimeMs: decision.estimatedComputeTimeMs,
+      estimatedGain: decision.estimatedGain,
+      decisionReason: decision.reason,
+      isForceSwarm,
+      inputBytes: workload.data.totalPayloadBytes,
+      parameters: { ...params, totalChunks: chunkSpecs.length, totalFrames, chunkSize }
+    });
+
+    try {
+      const t_sched_start = performance.now();
+      const chunkResults: VideoChunkResult[] = [];
+      const pendingSpecs = [...chunkSpecs];
+      const concurrency = Math.max(1, effectiveWorkerCount * 2); // Dynamic work queue with pipeline overlap
+
+      // Worker dynamic consumer pool: pulls next chunk as soon as previous completes
+      const workerPool = Array.from({ length: concurrency }, async () => {
+        while (pendingSpecs.length > 0) {
+          const nextSpec = pendingSpecs.shift();
+          if (!nextSpec) break;
+          const chunkRes = await this.dispatchVideoChunkWithRetry(nextSpec, workload, isForceSwarm);
+          chunkResults.push(chunkRes);
+        }
+      });
+
+      await Promise.all(workerPool);
+      const t_scheduling_ms = performance.now() - t_sched_start;
+      Logger.execution(`[PAYLOAD] Result received: All ${chunkResults.length} video chunks completed`);
+
+      const t_reasm_start = performance.now();
+      const assembledMetrics = VideoChunkEngine.assembleVideoAnalysis(
+        parentWorkloadId,
+        chunkResults
+      );
+      const t_reassembly_ms = performance.now() - t_reasm_start;
+      Logger.execution(`[PAYLOAD] Video analysis aggregation completed in ${t_reassembly_ms.toFixed(1)} ms (${assembledMetrics.length} frames)`);
+
+      const t_val_start = performance.now();
+      if (assembledMetrics.length !== totalFrames) {
+        throw new Error(`Assembled frame analysis length mismatch: expected ${totalFrames} frames, got ${assembledMetrics.length}`);
+      }
+      const t_validation_ms = performance.now() - t_val_start;
+
+      const t_total_ms = performance.now() - t_workload_start;
+      const maxComputeMs = Math.max(...chunkResults.map(r => r.executionTimeMs || 0));
+      const avgComputeMs = chunkResults.reduce((sum, r) => sum + (r.executionTimeMs || 0), 0) / chunkResults.length;
+
+      this.recordWorkloadEvent({
+        workloadId: parentWorkloadId,
+        taskId: parentWorkloadId,
+        workerId: simActive ? SimulationWorkerAdapter.DEVICE_ID : 'multi-worker-swarm',
+        workerHostname: simActive ? '🧪 Virtual Apple Silicon Worker' : `${effectiveWorkerCount} Swarm Nodes`,
+        status: 'COMPLETE',
+        startTimeMs,
+        endTimeMs: Date.now(),
+        durationSeconds: t_total_ms / 1000,
+        workerComputeTimeMs: Math.round(avgComputeMs),
+        transferTimeMs: Math.max(0, t_total_ms - maxComputeMs),
+        queueTimeMs: 0.0,
+        validationTimeMs: t_validation_ms,
+        localVsRemote: 'REMOTE',
+        kernelId: 'video_frame_analysis_v1',
+        batchId,
+        decision: decision.decision,
+        estimatedLocalTimeMs: decision.estimatedLocalTimeMs,
+        estimatedSwarmTimeMs: decision.estimatedSwarmTimeMs,
+        estimatedQueueTimeMs: decision.estimatedQueueTimeMs,
+        estimatedTransferTimeMs: decision.estimatedTransferTimeMs,
+        estimatedComputeTimeMs: decision.estimatedComputeTimeMs,
+        estimatedGain: decision.estimatedGain,
+        decisionReason: decision.reason,
+        isForceSwarm,
+        inputBytes: workload.data.totalPayloadBytes,
+        parameters: { ...params, totalChunks: chunkSpecs.length, totalFrames, chunkSize }
+      });
+
+      const jsonStrResult = JSON.stringify(assembledMetrics);
+      const isBinaryFrameRequest = Boolean((workload.data as any).rawPayloadBuffer);
+      const outputData = isBinaryFrameRequest ? Buffer.from(jsonStrResult, 'utf-8') : Buffer.from(jsonStrResult, 'utf-8').toString('base64');
+
+      return {
+        id: msg.id,
+        result: {
+          status: 'COMPLETED',
+          taskId: parentWorkloadId,
+          workloadId: parentWorkloadId,
+          outputData,
+          totalChunks: chunkSpecs.length,
+          completedChunks: chunkSpecs.length,
+          totalFrames: assembledMetrics.length,
+          telemetry: {
+            decisionMs: t_decision_ms,
+            chunkingMs: t_chunking_ms,
+            schedulingMs: t_scheduling_ms,
+            workerComputeMs: Math.round(avgComputeMs),
+            transferMs: Math.max(0, Math.round(t_total_ms - maxComputeMs)),
+            reassemblyMs: t_reassembly_ms,
+            validationMs: t_validation_ms,
+            coreTotalMs: t_total_ms + t_decision_ms,
+            chunkDistribution: chunkResults.map(r => ({
+              chunkIndex: r.chunkIndex,
+              workerId: r.workerId,
+              executionTimeMs: r.executionTimeMs
+            }))
+          }
+        }
+      };
+    } catch (err: any) {
+      Logger.error(`Chunked video analysis failed for ${parentWorkloadId}: ${err.message}`);
+      return {
+        id: msg.id,
+        result: {
+          status: isForceSwarm ? 'FAILED' : 'LOCAL_FALLBACK',
+          taskId: parentWorkloadId,
+          workloadId: parentWorkloadId,
+          reason: `Chunked video execution error: ${err.message}`
+        }
+      };
+    }
+  }
+
+  private async dispatchVideoChunkWithRetry(
+    spec: VideoChunkSpec,
+    parentWorkload: WorkloadDescriptor,
+    isForceSwarm: boolean = false,
+    maxRetries: number = 2
+  ): Promise<VideoChunkResult> {
+    const parentWorkloadId = parentWorkload.workloadId || 'wkl-video-parent';
+    const chunkTaskId = `${parentWorkloadId}-chunk-${String(spec.metadata.chunkIndex).padStart(2, '0')}`;
+
+    let task = this.taskStore.getTask(chunkTaskId);
+    if (!task) {
+      task = this.taskStore.createTask({
+        id: chunkTaskId,
+        inputRef: 'inline_chunk_payload',
+        computationDescriptor: JSON.stringify({
+          kernelId: 'video_frame_analysis_v1',
+          parameters: {
+            width: spec.metadata.width,
+            height: spec.metadata.height,
+            channels: spec.metadata.channels,
+            mode: spec.metadata.mode,
+            frameCount: spec.metadata.frameCount,
+            startFrameIndex: spec.metadata.startFrameIndex,
+            chunkIndex: spec.metadata.chunkIndex,
+            totalChunks: spec.metadata.totalChunks
+          }
+        }),
+        requiredResources: { minCpuCores: 1, minRamMb: 64 },
+        dependencies: [],
+        executionConstraints: { parentWorkloadId },
+        resultDestination: 'memory',
+        status: TaskStatus.PENDING
+      });
+    }
+
+    if (this.workloadPipeline) {
+      this.workloadPipeline.trackTaskInWorkload(parentWorkloadId, chunkTaskId);
+    }
+
+    let lastError = 'No eligible worker found';
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      const allWorkers = this.workerManager.listWorkers();
+      const scheduleResult = this.scheduler
+        ? this.scheduler.scheduleTask(task, allWorkers, this.taskStore)
+        : { status: 'NO_ELIGIBLE_WORKER', selectedWorker: undefined };
+
+      let targetWorkerId: string | null = null;
+
+      if (scheduleResult.status === 'ASSIGNED' && scheduleResult.selectedWorker) {
+        targetWorkerId = scheduleResult.selectedWorker.deviceId;
+      } else if (this.simulationWorker.isEnabled) {
+        targetWorkerId = SimulationWorkerAdapter.DEVICE_ID;
+      }
+
+      if (!targetWorkerId) {
+        throw new Error(`Scheduler could not place video chunk ${spec.metadata.chunkIndex} (attempt ${attempt + 1}/${maxRetries + 1}): ${scheduleResult.status}`);
+      }
+
+      const payloadBytes = spec.payload.length;
+      const envTimeoutMs = process.env.SWARMX_WORKLOAD_TIMEOUT_MS ? parseInt(process.env.SWARMX_WORKLOAD_TIMEOUT_MS, 10) : 0;
+      const dynamicChunkTimeoutMs = envTimeoutMs > 0 ? envTimeoutMs : Math.max(30000, 30000 + Math.round((payloadBytes / (1024 * 1024)) * 1500));
+
+      this.taskStore.assignTask(chunkTaskId, targetWorkerId, dynamicChunkTimeoutMs);
+      this.decisionEngine.acquireReservation(targetWorkerId);
+
+      Logger.execution(`[PAYLOAD] Dispatching video chunk ${spec.metadata.chunkIndex + 1}/${spec.metadata.totalChunks} (${(payloadBytes / (1024 * 1024)).toFixed(2)} MB, ${spec.metadata.frameCount} frames) to ${targetWorkerId}`);
+
+      try {
+        const chunkStartMs = Date.now();
+        const completionPromise = new Promise<any>((resolve) => {
+          const timer = setTimeout(() => {
+            resolve({ status: 'TIMEOUT', error: `Video chunk ${spec.metadata.chunkIndex} timed out after ${(dynamicChunkTimeoutMs / 1000).toFixed(0)}s` });
+          }, dynamicChunkTimeoutMs);
+
+          if (this.workloadPipeline) {
+            this.workloadPipeline.onTaskFinished(chunkTaskId, (res) => {
+              clearTimeout(timer);
+              resolve({
+                success: res.success,
+                status: res.success ? 'COMPLETED' : 'FAILED',
+                outputData: res.outputData || (res.task ? res.task.resultDestination : ''),
+                error: res.error,
+                executionTimeMs: res.executionTimeMs || (Date.now() - chunkStartMs)
+              });
+            });
+          } else {
+            clearTimeout(timer);
+            resolve({ success: true, status: 'COMPLETED', outputData: '' });
+          }
+        });
+
+        task.assignedWorkerId = targetWorkerId;
+        if (targetWorkerId === SimulationWorkerAdapter.DEVICE_ID || targetWorkerId.startsWith('sim-worker-virtual-')) {
+          this.simulationWorker.executeTask(task, spec.payload, spec.metadata.frameCount)
+            .then(async (simRes) => {
+              if (this.workloadPipeline) {
+                await this.workloadPipeline.handleTaskResult(simRes);
+              }
+            })
+            .catch((err) => {
+              this.taskStore.recordTaskFailure(chunkTaskId, targetWorkerId!, 'SIMULATION_ERROR', { error: err.message });
+            });
+        } else {
+          const payloadBase64 = spec.payload.toString('base64');
+          const sent = this.transportServer.sendExecuteTask(
+            targetWorkerId,
+            task,
+            payloadBase64,
+            spec.metadata.frameCount
+          );
+          if (!sent) {
+            this.taskStore.recordTaskFailure(chunkTaskId, targetWorkerId, 'TRANSPORT_SEND_FAILED', {});
+            throw new Error(`Failed to send video chunk ${spec.metadata.chunkIndex} to worker ${targetWorkerId}`);
+          }
+        }
+
+        const res = await completionPromise;
+        if (res.status === 'COMPLETED' && res.outputData) {
+          return {
+            parentWorkloadId,
+            chunkIndex: spec.metadata.chunkIndex,
+            totalChunks: spec.metadata.totalChunks,
+            startFrameIndex: spec.metadata.startFrameIndex,
+            frameCount: spec.metadata.frameCount,
+            outputData: res.outputData,
+            workerId: targetWorkerId,
+            executionTimeMs: res.executionTimeMs || (Date.now() - chunkStartMs)
+          };
+        } else {
+          lastError = res.error || `Video chunk ${spec.metadata.chunkIndex} execution failed on ${targetWorkerId}`;
+          this.taskStore.recordTaskFailure(chunkTaskId, targetWorkerId, 'EXECUTION_FAILED', { error: lastError });
+        }
+      } finally {
+        this.decisionEngine.releaseReservation(targetWorkerId);
+      }
+    }
+
+    throw new Error(`Video chunk ${spec.metadata.chunkIndex} failed after ${maxRetries + 1} attempts: ${lastError}`);
   }
 
   public async stop(): Promise<void> {

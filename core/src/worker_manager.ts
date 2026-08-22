@@ -46,13 +46,12 @@ export class WorkerManager {
 
   /**
    * Hard eligibility gate (0 or 1):
-   * Gate conditions:
-   * 1. Battery: battery_level >= 0.20 OR is_charging === true
-   * 2. Thermal: thermal_state < SERIOUS (i.e. NOMINAL or FAIR only)
-   * 3. CPU: cpu_utilization < 0.90 (90%)
    */
   public evaluateEligibility(telemetry: WorkerTelemetry): boolean {
-    const batteryOk = telemetry.batteryLevel >= 0.20 || telemetry.isCharging === true;
+    const ignoreBattery = process.env.SWARMX_DEMO_IGNORE_BATTERY === 'true' ||
+                          process.env.SWARMX_DEMO_IGNORE_BATTERY === '1' ||
+                          process.env.SWARMX_FORCE_SWARM === '1';
+    const batteryOk = ignoreBattery || telemetry.batteryLevel >= 0.20 || telemetry.isCharging === true;
     const thermalOk = telemetry.thermalState < ThermalState.SERIOUS;
     const cpuOk = telemetry.cpuUtilization < 0.90;
 
