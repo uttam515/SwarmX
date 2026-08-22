@@ -3,6 +3,8 @@ import { expect } from 'chai';
 import * as net from 'net';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as crypto from 'crypto';
+import WebSocket from 'ws';
 import Database from 'better-sqlite3';
 import { IpcServer } from '../src/ipc_server';
 import { TaskStore } from '../src/db/task_store';
@@ -207,5 +209,282 @@ describe('Single-Round-Trip Execution & Trustworthy Telemetry Tests (Phase 9B)',
     expect(res.metadata.result.status).to.equal('LOCAL_FALLBACK');
     expect(res.metadata.result.reason).to.be.a('string');
     expect(res.metadata.result.telemetry.decisionMs).to.be.a('number');
+  });
+
+  it('3. Single Binary Frame with rawPayloadBuffer dispatches to physical worker, receives real matrix data, passes validation, and completes without retrying', async () => {
+    // 1. Disable simulation mode so cluster uses physical remote worker
+    simulationWorker.setConfig({ enabled: false });
+
+    // 2. Connect and pair a simulated physical worker (e.g. Mac #2)
+    const deviceId = 'physical-mac-02';
+    const deviceName = "Jatin's MacBook Air";
+    const ws = new WebSocket(`ws://127.0.0.1:${testPort}`);
+    await new Promise<void>((resolve) => ws.on('open', resolve));
+
+    const workerKeypair = crypto.generateKeyPairSync('x25519');
+    const workerPubkeyHex = workerKeypair.publicKey.export({ type: 'spki', format: 'der' }).subarray(-32).toString('hex');
+    const salt = crypto.randomBytes(16);
+
+    // Send discovery beacon
+    const discoveryAckPromise = new Promise<void>((resolve) => {
+      const handler = (data: any) => {
+        const msg = JSON.parse(data.toString('utf-8'));
+        if (msg.type === 'DISCOVERY_ACK') {
+          ws.off('message', handler);
+          resolve();
+        }
+      };
+      ws.on('message', handler);
+    });
+
+    ws.send(JSON.stringify({
+      type: 'DISCOVERY_BEACON',
+      deviceId,
+      deviceName,
+      host: '127.0.0.1',
+      port: testPort,
+      capabilityProfile: {
+        capabilitySchemaVersion: 1,
+        deviceId,
+        deviceName,
+        osType: 'darwin',
+        osVersion: '15.0',
+        cpuArch: 'arm64',
+        cpuCores: 8,
+        totalRamMb: 16384,
+        hasGpu: true
+      }
+    }));
+    await discoveryAckPromise;
+
+    // Initiate pairing
+    const initRes = await ipcServer.handleMessage({
+      id: 10,
+      method: 'initiatePairing',
+      params: { workerDeviceId: deviceId }
+    });
+    const initiationId = initRes.result.initiationId;
+    const hostPubKeyHex = initRes.result.hostPublicKeyHex;
+
+    // Derive SAS and directional keys
+    const hostPubDer = Buffer.concat([Buffer.from('302a300506032b656e032100', 'hex'), Buffer.from(hostPubKeyHex, 'hex')]);
+    const hostKeyObj = crypto.createPublicKey({ key: hostPubDer, format: 'der', type: 'spki' });
+    const sharedSecret = crypto.diffieHellman({ privateKey: workerKeypair.privateKey, publicKey: hostKeyObj });
+    const sasContext = `swarmx-sas-v1:swarmx-host:${deviceId}:${hostPubKeyHex}:${workerPubkeyHex}`;
+    const sasCode = PairingService.deriveSasCode(sharedSecret, salt, sasContext);
+    const { hostToWorkerKey, workerToHostKey } = PairingService.deriveDirectionalKeys(sharedSecret, salt);
+
+    // Confirm pairing
+    const confirmPromise = new Promise<any>((resolve) => {
+      const handler = (data: any) => {
+        const msg = JSON.parse(data.toString('utf-8'));
+        if (msg.type === 'PAIRING_SUCCESS') {
+          ws.off('message', handler);
+          resolve(msg);
+        }
+      };
+      ws.on('message', handler);
+    });
+
+    ws.send(JSON.stringify({
+      type: 'PAIRING_CONFIRM',
+      initiationId,
+      workerDeviceId: deviceId,
+      workerDeviceName: deviceName,
+      workerPublicKeyHex: workerPubkeyHex,
+      workerSaltHex: salt.toString('hex'),
+      confirmedSasCode: sasCode,
+      capabilityProfile: {
+        capabilitySchemaVersion: 1,
+        deviceId,
+        deviceName,
+        osType: 'darwin',
+        osVersion: '15.0',
+        cpuArch: 'arm64',
+        cpuCores: 8,
+        totalRamMb: 16384,
+        hasGpu: true
+      }
+    }));
+    const pairSuccess = await confirmPromise;
+    const sessionId = pairSuccess.sessionId;
+
+    // Send initial telemetry (Eligible = true)
+    const telemAckPromise = new Promise<void>((resolve) => {
+      const handler = (data: any) => {
+        const msg = JSON.parse(data.toString('utf-8'));
+        if (msg.type === 'ENCRYPTED_TELEMETRY_ACK') {
+          ws.off('message', handler);
+          resolve();
+        }
+      };
+      ws.on('message', handler);
+    });
+
+    const telemIv = Buffer.alloc(12);
+    crypto.randomBytes(4).copy(telemIv, 0, 0, 4);
+    telemIv.writeBigUInt64BE(BigInt(1), 4);
+    const telemCipher = crypto.createCipheriv('aes-256-gcm', workerToHostKey, telemIv);
+    telemCipher.setAAD(Buffer.from(`${sessionId}:1`, 'utf-8'));
+    const telemPayload = JSON.stringify({
+      deviceId,
+      batteryLevel: 0.95,
+      isCharging: true,
+      thermalState: 0,
+      cpuUtilization: 0.10,
+      availableRamMb: 12000,
+      timestampMs: Date.now()
+    });
+    const telemCiphertext = Buffer.concat([telemCipher.update(Buffer.from(telemPayload, 'utf-8')), telemCipher.final()]);
+
+    ws.send(JSON.stringify({
+      type: 'ENCRYPTED_TELEMETRY',
+      envelope: {
+        sessionId,
+        sequenceNum: 1,
+        ivNonce: telemIv.toString('base64'),
+        ciphertext: telemCiphertext.toString('base64'),
+        authTag: telemCipher.getAuthTag().toString('base64')
+      }
+    }));
+    await telemAckPromise;
+
+    // Verify worker is registered & eligible
+    expect(workerManager.listWorkers().length).to.equal(1);
+    expect(workerManager.getWorker(deviceId)?.isEligible).to.be.true;
+
+    // 3. Set up physical worker task execution listener
+    let receivedInputPayload: string = '';
+    const taskExecutionPromise = new Promise<any>((resolve) => {
+      ws.on('message', (data: any) => {
+        const msg = JSON.parse(data.toString('utf-8'));
+        if (msg.type === 'EXECUTE_TASK') {
+          // Decrypt task envelope with hostToWorkerKey
+          const env = msg.envelope;
+          const iv = Buffer.from(env.ivNonce, 'base64');
+          const decipher = crypto.createDecipheriv('aes-256-gcm', hostToWorkerKey, iv);
+          decipher.setAAD(Buffer.from(`${env.sessionId}:${env.sequenceNum}`, 'utf-8'));
+          decipher.setAuthTag(Buffer.from(env.authTag, 'base64'));
+          const decrypted = Buffer.concat([decipher.update(Buffer.from(env.ciphertext, 'base64')), decipher.final()]);
+          const taskPayload = JSON.parse(decrypted.toString('utf-8'));
+          receivedInputPayload = taskPayload.inputData;
+
+          // Decode input matrix data from Base64
+          const rawBytes = Buffer.from(taskPayload.inputData, 'base64');
+          const inFloats = new Float32Array(rawBytes.buffer, rawBytes.byteOffset, rawBytes.byteLength / 4);
+
+          // Perform GEMM computation: M=64, K=64, N=64
+          const M = 64, K = 64, N = 64;
+          const a = inFloats.subarray(0, M * K);
+          const b = inFloats.subarray(M * K);
+          const c = new Float32Array(M * N);
+
+          for (let i = 0; i < M; i++) {
+            for (let j = 0; j < N; j++) {
+              let sum = 0;
+              for (let p = 0; p < K; p++) {
+                sum += a[i * K + p] * b[p * N + j];
+              }
+              c[i * N + j] = sum;
+            }
+          }
+
+          const outBytes = Buffer.from(c.buffer, c.byteOffset, c.byteLength);
+          const outBase64 = outBytes.toString('base64');
+
+          // Send encrypted TASK_RESULT back to Core
+          const resIv = Buffer.alloc(12);
+          crypto.randomBytes(4).copy(resIv, 0, 0, 4);
+          resIv.writeBigUInt64BE(BigInt(2), 4);
+          const resCipher = crypto.createCipheriv('aes-256-gcm', workerToHostKey, resIv);
+          resCipher.setAAD(Buffer.from(`${sessionId}:2`, 'utf-8'));
+          const resPayload = JSON.stringify({
+            taskId: taskPayload.taskId,
+            attemptNumber: taskPayload.attemptNumber || 1,
+            status: 'COMPLETED',
+            outputData: outBase64,
+            executionTimeMs: 15,
+            itemCount: 1,
+            workerHostname: deviceName,
+            workerPid: 12345
+          });
+          const resCiphertext = Buffer.concat([resCipher.update(Buffer.from(resPayload, 'utf-8')), resCipher.final()]);
+
+          ws.send(JSON.stringify({
+            type: 'TASK_RESULT',
+            workerDeviceId: deviceId,
+            taskId: taskPayload.taskId,
+            envelope: {
+              sessionId,
+              sequenceNum: 2,
+              ivNonce: resIv.toString('base64'),
+              ciphertext: resCiphertext.toString('base64'),
+              authTag: resCipher.getAuthTag().toString('base64')
+            }
+          }));
+
+          resolve(taskPayload);
+        }
+      });
+    });
+
+    // 4. Dispatch single-task binary matrix multiplication from Python client
+    const M = 64, K = 64, N = 64;
+    const aFloats = new Float32Array(M * K).fill(1.5);
+    const bFloats = new Float32Array(K * N).fill(2.0);
+    const inFloats = new Float32Array(M * K + K * N);
+    inFloats.set(aFloats, 0);
+    inFloats.set(bFloats, M * K);
+    const rawBuffer = Buffer.from(inFloats.buffer, inFloats.byteOffset, inFloats.byteLength);
+
+    const workload = {
+      workloadId: 'wkl-physical-matrix-01',
+      version: '1.0.0',
+      computation: {
+        domain: 'NUMERICAL_COMPUTATION',
+        kernelId: 'matrix_multiply_v1',
+        parameters: { M, K, N, dtype: 'FLOAT32' }
+      },
+      data: {
+        itemCount: 1,
+        totalPayloadBytes: rawBuffer.length,
+        format: 'FLOAT32_ARRAY'
+      },
+      constraints: {
+        isPure: true,
+        isIdempotent: true,
+        toleranceValidator: 'NUMERIC_TOLERANCE',
+        maxMse: 1e-4
+      }
+    };
+
+    const res = await sendBinaryRequest(
+      { id: 3, method: 'executeWorkload', params: { workload, forceSwarm: true } },
+      rawBuffer
+    );
+
+    // Wait for physical worker to receive the task
+    const executedTask = await taskExecutionPromise;
+    expect(executedTask).to.not.be.undefined;
+
+    // Verify receivedInputPayload is NOT 'inline_payload' and contains actual base64 matrix data
+    expect(receivedInputPayload).to.not.equal('inline_payload');
+    expect(receivedInputPayload.length).to.be.greaterThan(100);
+
+    // Verify task status, validation, and zero retries in task store
+    expect(res.metadata.result.status).to.equal('COMPLETED');
+    expect(res.outputPayload.length).to.equal(M * N * 4);
+
+    const alignedBuf = Buffer.from(res.outputPayload);
+    const outFloats = new Float32Array(alignedBuf.buffer, alignedBuf.byteOffset, alignedBuf.byteLength / 4);
+    expect(outFloats[0]).to.be.closeTo(1.5 * 2.0 * K, 1e-4);
+
+    const storedTask = taskStore.getTask(executedTask.taskId);
+    expect(storedTask).to.not.be.undefined;
+    expect(storedTask!.status).to.equal('COMPLETED');
+    expect(storedTask!.retryCount).to.equal(0);
+    expect(storedTask!.attemptHistory.length).to.equal(0);
+
+    ws.close();
   });
 });
