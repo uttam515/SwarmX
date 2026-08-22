@@ -129,7 +129,12 @@ def compute_local_baseline(raw_bytes: bytes, total_frames: int, width: int, heig
     return results
 
 def main():
-    print_header("SWARMX DISTRIBUTED VIDEO ANALYSIS")
+    print_header("SWARMX DISTRIBUTED VIDEO FRAME ANALYSIS")
+    print("  • Flagship Pipeline : Distributed Video Frame Scene & Motion Analysis (v1)")
+    print("  • Workload Config   : 900 Frames (512 × 512 RGBA uint8, ~900 MB planar payload)")
+    print("  • Dynamic Partitioning: 30 Frames / Chunk (30 Independent Task Chunks)")
+    print("  • Execution Target  : Dynamic Work-Queue Dispatch Across Available Swarm Nodes")
+    print("  • Execution Mode    : 100% Non-Interactive Automatic Demo (No Terminal Prompts)")
 
     # 1. Workload Configuration
     total_frames = 900
@@ -141,7 +146,12 @@ def main():
 
     # 2. Check Cluster State
     is_online, status_msg, workers_list, eligible_count = check_cluster_readiness()
-    print(f"📡 SwarmX Cluster State: {status_msg} ({eligible_count} Eligible Workers)")
+    print(f"\n📡 SwarmX Cluster State: {status_msg} ({eligible_count} Eligible Worker{'s' if eligible_count != 1 else ''})")
+    for w in workers_list:
+        dev_name = w.get("capabilityProfile", {}).get("deviceName", w.get("deviceId", "Worker"))
+        arch = w.get("capabilityProfile", {}).get("cpuArch", "arm64")
+        cores = w.get("capabilityProfile", {}).get("cpuCores", "?")
+        print(f"   🍏 {dev_name} ({arch}, {cores} cores) — READY")
     
     if not is_online or eligible_count == 0:
         print("\n⚠️  SwarmX Core or Workers not connected.")

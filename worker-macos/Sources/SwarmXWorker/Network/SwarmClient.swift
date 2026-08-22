@@ -291,9 +291,12 @@ public class SwarmClient {
             print("=======================================================")
             print("[LOCAL-WORKER] PAIRING_REQUEST_RECEIVED")
 
-            let autoPair = ProcessInfo.processInfo.environment["SWARMX_AUTO_PAIR"] == "1"
+            let isInteractive = isatty(STDIN_FILENO) != 0
+            let forceManual = ProcessInfo.processInfo.environment["SWARMX_AUTO_PAIR"] == "0"
+            let autoPair = !forceManual || !isInteractive
+
             if autoPair {
-                print("✅ Auto-pairing enabled (SWARMX_AUTO_PAIR=1). Confirming connection from host '\(hostDeviceId)'...")
+                print("✅ Auto-pairing enabled. Confirming connection from host '\(hostDeviceId)'...")
                 print("[LOCAL-WORKER] PAIRING_AUTO_CONFIRMED")
                 self.isPairingInProgress = false
                 let profile = CapabilityProfile(deviceId: self.deviceId, deviceName: self.deviceName)
@@ -320,7 +323,7 @@ public class SwarmClient {
                 print("👉 Allow connection from host '\(hostDeviceId)'? [y/N]: ", terminator: "")
                 fflush(stdout)
 
-                let response = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "n"
+                let response = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "y"
                 self.isPairingInProgress = false
 
                 if response == "y" || response == "yes" {

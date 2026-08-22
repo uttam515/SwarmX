@@ -29,7 +29,8 @@ def get_swarm_client(socket_path: str = "/tmp/swarmx.sock") -> SwarmClient:
 def is_certified_box_blur(filter_spec) -> bool:
     """Only certified ImageFilter.BoxBlur operations with a valid radius are eligible."""
     if isinstance(filter_spec, ImageFilter.BoxBlur):
-        return hasattr(filter_spec, 'radius') and filter_spec.radius is not None
+        radius = getattr(filter_spec, 'radius', None)
+        return radius is not None and radius > 0
     return False
 
 def swarmx_image_filter(self: Image.Image, filter_spec) -> Image.Image:

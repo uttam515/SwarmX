@@ -142,6 +142,15 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
         case 'viewLogs':
           vscode.commands.executeCommand('swarmx.viewLogs');
           break;
+        case 'cancelActiveWorkload':
+          try {
+            await this.ipcClient.request('cancelWorkload', { workloadId: data?.workloadId || 'ALL' });
+            vscode.window.showInformationMessage('⏹ Active workload cancelled.');
+            await this.update();
+          } catch (e: any) {
+            vscode.window.showErrorMessage(`Failed to cancel workload: ${e.message}`);
+          }
+          break;
       }
     });
 
@@ -229,8 +238,8 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
     const isMatmul = lastWkl?.kernelId === 'matrix_multiply_v1' || (lastWkl?.workloadId && lastWkl.workloadId.includes('matmul'));
     const isVideo = lastWkl?.kernelId === 'video_frame_analysis_v1' || (lastWkl?.workloadId && lastWkl.workloadId.includes('video'));
 
-    let kernelDisplayName = '2D BoxBlur (image_filter_box_blur_v1)';
-    let workloadShapeStr = '1024 × 1024 (RGBA)';
+    let kernelDisplayName = 'Distributed Video Analysis (video_frame_analysis_v1)';
+    let workloadShapeStr = '900 Frames (512 × 512 RGBA)';
     if (isMatmul) {
       kernelDisplayName = 'NumPy MatMul (GEMM Float32)';
       const p = lastWkl?.parameters;
@@ -238,7 +247,10 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
       const K = p?.K || 512;
       const N = p?.N || 512;
       workloadShapeStr = `${M} × ${K} × ${N}`;
-    } else if (isVideo) {
+    } else if (lastWkl?.kernelId === 'image_filter_box_blur_v1') {
+      kernelDisplayName = '2D BoxBlur (image_filter_box_blur_v1)';
+      workloadShapeStr = '1024 × 1024 (RGBA)';
+    } else if (isVideo || !lastWkl) {
       kernelDisplayName = 'Distributed Video Analysis (video_frame_analysis_v1)';
       const p = lastWkl?.parameters;
       const tf = p?.totalFrames || lastWkl?.totalFrames || 900;
@@ -917,6 +929,9 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
               <span class="row-label">Distribution</span>
               <span class="row-val" style="font-size: 10px;">${distributionStr}</span>
             </div>
+            ${activeChunks > 0 || (lastWkl && lastWkl.status === 'RUNNING') ? `
+              <button class="btn btn-danger btn-sm" style="width: 100%; margin-top: 8px;" onclick="sendAction('cancelActiveWorkload', { workloadId: '${lastWkl?.workloadId || ''}' })">⏹ Cancel Active Workload</button>
+            ` : ''}
           </div>
         </div>
 

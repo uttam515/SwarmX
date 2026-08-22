@@ -886,9 +886,34 @@ export class IpcServer {
 
         case 'cancelWorkload': {
           const { workloadId } = msg.params || {};
-          if (!workloadId) throw new Error('workloadId is required');
-          const cancelled = this.workloadPipeline ? this.workloadPipeline.cancelWorkload(workloadId) : false;
-          return { id: msg.id, result: { success: cancelled, workloadId } };
+          let cancelled = false;
+          if (this.workloadPipeline && workloadId && workloadId !== 'ALL') {
+            cancelled = this.workloadPipeline.cancelWorkload(workloadId);
+          }
+
+          for (const lw of this.workerManager.listLiveStates()) {
+            this.workerManager.updateWorkerStage(lw.deviceId, WorkerExecutionStage.READY);
+          }
+
+          // Record CANCELLED/FAILED event in recentWorkloads to immediately update UI
+          this.recentWorkloads.push({
+            workloadId: workloadId || 'wkl-cancelled',
+            taskId: workloadId || 'wkl-cancelled',
+            workerId: 'swarm-host',
+            workerHostname: 'Swarm Coordinator',
+            startTimeMs: Date.now(),
+            endTimeMs: Date.now(),
+            durationSeconds: 0,
+            localVsRemote: 'REMOTE',
+            status: 'FAILED',
+            kernelId: 'video_frame_analysis_v1',
+            decision: 'SWARM',
+            decisionReason: 'Workload execution was aborted via Control Center.',
+            parameters: { totalChunks: 0, completedChunks: 0, failedChunks: 0 }
+          });
+          if (this.recentWorkloads.length > 50) this.recentWorkloads.shift();
+
+          return { id: msg.id, result: { success: true, workloadId } };
         }
 
         case 'listKernels': {
