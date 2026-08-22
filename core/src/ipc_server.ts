@@ -282,6 +282,7 @@ export class IpcServer {
           return { id: msg.id, result: discovered };
         }
 
+        case 'listWorkers':
         case 'listConnectedWorkers': {
           const workers = this.workerManager.listWorkers();
           return { id: msg.id, result: workers };
@@ -567,9 +568,21 @@ export class IpcServer {
             // 5. Dispatch via SimulationWorkerAdapter or TransportServer
             Logger.execution(`Dispatching task: ${task.id}`);
             task.assignedWorkerId = workerId;
+
+            const payloadBase64 = workload.data.payloadBase64 || (
+              (workload.data as any).rawPayloadBuffer
+                ? (workload.data as any).rawPayloadBuffer.toString('base64')
+                : ''
+            );
+            const payloadBuffer = (workload.data as any).rawPayloadBuffer || (
+              workload.data.payloadBase64
+                ? Buffer.from(workload.data.payloadBase64, 'base64')
+                : Buffer.alloc(0)
+            );
+
             if (workerId === SimulationWorkerAdapter.DEVICE_ID || workerId.startsWith('sim-worker-virtual-')) {
               Logger.execution(`Simulation execution started: ${workerId}`);
-              this.simulationWorker.executeTask(task, workload.data.payloadBase64, workload.data.itemCount)
+              this.simulationWorker.executeTask(task, payloadBuffer, workload.data.itemCount)
                 .then(async (simResult) => {
                   if (this.workloadPipeline) {
                     await this.workloadPipeline.handleTaskResult(simResult);
@@ -583,7 +596,7 @@ export class IpcServer {
               const sent = this.transportServer.sendExecuteTask(
                 workerId,
                 task,
-                workload.data.payloadBase64,
+                payloadBase64,
                 workload.data.itemCount
               );
 

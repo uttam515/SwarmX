@@ -60,29 +60,31 @@ export class TransportServer {
           if (response) {
             ws.send(JSON.stringify(response));
           }
-          const devId = msg.deviceId || msg.workerDeviceId;
+          const devId = msg.deviceId || msg.workerDeviceId || (ws as any)._workerDeviceId;
           if (devId) {
             const existingWs = this.workerSockets.get(devId);
             if (existingWs && existingWs !== ws) {
               try { existingWs.close(); } catch (e) {}
             }
             workerDeviceId = devId;
+            (ws as any)._workerDeviceId = devId;
             this.workerSockets.set(workerDeviceId!, ws);
           }
         } catch (err: any) {
-          Logger.error(`Transport error handling message from ${workerDeviceId || 'unknown'}: ${err.message}`);
+          Logger.error(`Transport error handling message from ${workerDeviceId || (ws as any)._workerDeviceId || 'unknown'}: ${err.message}`);
           ws.send(JSON.stringify({ error: err.message }));
         }
       });
 
       ws.on('close', () => {
-        Logger.transport(`WebSocket closed for ${workerDeviceId || remoteAddress}`);
-        if (workerDeviceId && this.workerSockets.get(workerDeviceId) === ws) {
-          this.workerSockets.delete(workerDeviceId);
-          this.workerManager.unregisterWorker(workerDeviceId);
-          Logger.workerState(`DISCONNECTED: ${workerDeviceId}`);
+        const devId = (ws as any)._workerDeviceId || workerDeviceId;
+        Logger.transport(`WebSocket closed for ${devId || remoteAddress}`);
+        if (devId) {
+          this.workerSockets.delete(devId);
+          this.workerManager.unregisterWorker(devId);
+          Logger.workerState(`DISCONNECTED: ${devId}`);
           // Worker-loss recovery: Reclaim all in-flight tasks assigned to this disconnected worker
-          this.taskStore.recoverWorkerLoss(workerDeviceId);
+          this.taskStore.recoverWorkerLoss(devId);
         }
       });
     });
@@ -93,10 +95,11 @@ export class TransportServer {
       });
     });
 
-    // Start recurring Lease Watchdog timer (every 5 seconds)
+    // Start recurring Lease & Worker Heartbeat Watchdog timer (every 2 seconds)
     this.watchdogTimer = setInterval(() => {
       this.taskStore.recoverExpiredLeases();
-    }, 5000);
+      this.sweepDeadWorkers();
+    }, 2000);
 
     // Advertise discovery via Bonjour / mDNS
     try {
@@ -324,6 +327,11 @@ export class TransportServer {
       case 'ENCRYPTED_TELEMETRY': {
         const decryptedBytes = this.pairingService.decryptEnvelope(msg.envelope);
         const telemetry = JSON.parse(decryptedBytes.toString('utf-8'));
+        const devId = telemetry.deviceId;
+        if (devId) {
+          (ws as any)._workerDeviceId = devId;
+          this.workerSockets.set(devId, ws);
+        }
         
         const workerState = this.workerManager.updateTelemetry(telemetry);
         Logger.workerState(
@@ -388,6 +396,34 @@ export class TransportServer {
 
       default:
         return { error: `Unhandled message type: ${msg.type}` };
+    }
+  }
+
+  /**
+   * Sweeps and unregisters disconnected or dead physical workers whose sockets closed
+   * or whose heartbeat timed out (> 10s without encrypted telemetry).
+   */
+  public sweepDeadWorkers(): void {
+    const now = Date.now();
+    const HEARTBEAT_TIMEOUT_MS = 10000;
+    for (const worker of this.workerManager.listWorkers()) {
+      // Do not sweep virtual simulation worker
+      if (worker.deviceId.startsWith('sim-worker-')) continue;
+
+      const ws = this.workerSockets.get(worker.deviceId);
+      const isSocketDead = !ws || ws.readyState !== WebSocket.OPEN;
+      const isHeartbeatExpired = (now - worker.lastHeartbeatMs) > HEARTBEAT_TIMEOUT_MS;
+
+      if (isSocketDead || isHeartbeatExpired) {
+        Logger.transport(`Worker heartbeat expired / disconnected: ${worker.deviceId} (socket: ${isSocketDead ? 'DEAD' : 'OPEN'}, idle: ${now - worker.lastHeartbeatMs}ms)`);
+        this.workerSockets.delete(worker.deviceId);
+        this.workerManager.unregisterWorker(worker.deviceId);
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          try { ws.close(); } catch (e) {}
+        }
+        Logger.workerState(`DISCONNECTED: ${worker.deviceId}`);
+        this.taskStore.recoverWorkerLoss(worker.deviceId);
+      }
     }
   }
 

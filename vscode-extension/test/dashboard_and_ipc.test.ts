@@ -388,15 +388,72 @@ describe('VS Code Extension — Lifecycle & Dashboard Tests (Phase 4)', () => {
     expect(html).to.include('wkl-matmul-001');
     expect(html).to.include('PASS (Tolerance-Aware) ✓');
 
-    // Verification of Collapsible Diagnostics
-    expect(html).to.include('<details class="diag-details">');
-    expect(html).to.include('▸ Live Chunk & Task Activity');
-    expect(html).to.include('▸ Queue & Scheduling Breakdown');
-    expect(html).to.include('▸ Worker Details & Telemetry');
-    expect(html).to.include('▸ Validation & Integrity');
-    expect(html).to.include('▸ Security & Cryptography');
-    expect(html).to.include('▸ Observability & Diagnostic Logs');
-    expect(html).to.include('▸ Architecture & Pipeline Flow');
+    // Verification of Collapsible Diagnostics with data-section identifiers
+    expect(html).to.include('data-section="live-chunk-activity"');
+    expect(html).to.include('data-section="queue-scheduling"');
+    expect(html).to.include('data-section="worker-telemetry"');
+    expect(html).to.include('data-section="discovered-devices"');
+    expect(html).to.include('data-section="validation-integrity"');
+    expect(html).to.include('data-section="security-cryptography"');
+    expect(html).to.include('data-section="diagnostics"');
+    expect(html).to.include('data-section="architecture"');
+
+    expect(html).to.include('Live Chunk & Task Activity');
+    expect(html).to.include('Queue & Scheduling Breakdown');
+    expect(html).to.include('Worker Details & Telemetry');
+    expect(html).to.include('Validation & Integrity');
+    expect(html).to.include('Security & Cryptography');
+    expect(html).to.include('Observability & Diagnostic Logs');
+    expect(html).to.include('Architecture & Pipeline Flow');
+  });
+
+  it('4b. DashboardViewProvider: Preserves collapsible section open state across multiple refreshes', () => {
+    const mockEnvManager: any = {
+      active: true,
+      forceSwarmDemo: false,
+      simulationMode: false,
+      sdkPath: '/path/to/sdk/python',
+      interpreter: 'python3'
+    };
+
+    const provider = new DashboardViewProvider({} as any, ipcClient, mockEnvManager);
+
+    // Initial state: all closed
+    expect(provider.isSectionOpen('live-chunk-activity')).to.be.false;
+    expect(provider.isSectionOpen('worker-telemetry')).to.be.false;
+
+    let html = (provider as any).getHtmlForWebview({ connected: true, recentWorkloads: [] });
+    expect(html).to.include('<details class="diag-details" data-section="live-chunk-activity">');
+    expect(html).to.not.include('<details class="diag-details" data-section="live-chunk-activity" open>');
+
+    // User opens 'live-chunk-activity' and 'worker-telemetry'
+    provider.setSectionOpen('live-chunk-activity', true);
+    provider.setSectionOpen('worker-telemetry', true);
+
+    expect(provider.isSectionOpen('live-chunk-activity')).to.be.true;
+    expect(provider.isSectionOpen('worker-telemetry')).to.be.true;
+    expect(provider.isSectionOpen('security-cryptography')).to.be.false;
+
+    // First telemetry refresh
+    html = (provider as any).getHtmlForWebview({ connected: true, recentWorkloads: [] });
+    expect(html).to.include('<details class="diag-details" data-section="live-chunk-activity" open>');
+    expect(html).to.include('<details class="diag-details" data-section="worker-telemetry" open>');
+    expect(html).to.include('<details class="diag-details" data-section="security-cryptography">');
+    expect(html).to.not.include('<details class="diag-details" data-section="security-cryptography" open>');
+
+    // Second telemetry refresh with new workload data
+    html = (provider as any).getHtmlForWebview({
+      connected: true,
+      recentWorkloads: [{ workloadId: 'wkl-live-01', status: 'COMPLETE' }]
+    });
+    expect(html).to.include('<details class="diag-details" data-section="live-chunk-activity" open>');
+    expect(html).to.include('<details class="diag-details" data-section="worker-telemetry" open>');
+
+    // User collapses 'live-chunk-activity' but keeps 'worker-telemetry' open
+    provider.setSectionOpen('live-chunk-activity', false);
+    html = (provider as any).getHtmlForWebview({ connected: true, recentWorkloads: [] });
+    expect(html).to.not.include('<details class="diag-details" data-section="live-chunk-activity" open>');
+    expect(html).to.include('<details class="diag-details" data-section="worker-telemetry" open>');
   });
 
   it('5. DashboardViewProvider: Renders Development Simulation Mode clearly', () => {
@@ -440,6 +497,72 @@ describe('VS Code Extension — Lifecycle & Dashboard Tests (Phase 4)', () => {
     expect(html).to.include('1 Virtual');
     expect(html).to.include('2D BoxBlur');
     expect(html).to.include('🧪 Virtual Worker — Simulation Mode');
+  });
+
+  it('5b. DashboardViewProvider: Truthful Worker State (No fake connected workers, discovered vs paired separation)', () => {
+    const mockEnvManager: any = {
+      active: true,
+      forceSwarmDemo: false,
+      simulationMode: false
+    };
+
+    const provider = new DashboardViewProvider({} as any, ipcClient, mockEnvManager);
+
+    // 1. Zero connected workers (Simulation OFF)
+    let html = (provider as any).getHtmlForWebview({
+      connected: true,
+      connectedWorkers: [],
+      discoveredWorkers: [
+        { deviceId: 'unpaired-mac-01', deviceName: "Nearby MacBook Air", host: '192.168.1.50', port: 50051 }
+      ],
+      recentWorkloads: [],
+      simulationMode: false
+    });
+
+    // Connected workers section MUST be empty
+    expect(html).to.include('No remote workers connected.');
+    expect(html).to.include('0 Available');
+    expect(html).to.include('○ OFFLINE');
+    expect(html).to.not.include('Jatin');
+    expect(html).to.not.include('Nearby MacBook Air [⚡ GPU]');
+
+    // Unpaired device MUST appear ONLY in Discovered Devices
+    expect(html).to.include('Nearby MacBook Air');
+    expect(html).to.include('Pair / Connect');
+
+    // 2. Physical Mac connects
+    html = (provider as any).getHtmlForWebview({
+      connected: true,
+      connectedWorkers: [
+        {
+          deviceId: 'live-mac-02',
+          isEligible: true,
+          capabilityProfile: { deviceName: "MacBook Pro M3", cpuCores: 12, totalRamMb: 16384, hasGpu: true, gpuModel: 'Apple M3 GPU' }
+        }
+      ],
+      discoveredWorkers: [],
+      recentWorkloads: [],
+      simulationMode: false
+    });
+
+    expect(html).to.include('● ONLINE (1 Node)');
+    expect(html).to.include('1 Physical');
+    expect(html).to.include('MacBook Pro M3');
+    expect(html).to.include('● READY');
+    expect(html).to.not.include('No remote workers connected.');
+
+    // 3. Physical Mac disconnects -> Immediately disappears
+    html = (provider as any).getHtmlForWebview({
+      connected: true,
+      connectedWorkers: [],
+      discoveredWorkers: [],
+      recentWorkloads: [],
+      simulationMode: false
+    });
+
+    expect(html).to.include('No remote workers connected.');
+    expect(html).to.include('0 Available');
+    expect(html).to.not.include('MacBook Pro M3');
   });
 
   it('8. DashboardViewProvider: Multi-Worker Chunked Execution & Dynamic Distribution', () => {
@@ -495,7 +618,8 @@ describe('VS Code Extension — Lifecycle & Dashboard Tests (Phase 4)', () => {
     expect(html).to.include('style="width: 75%;"');
 
     // Validates live chunk activity
-    expect(html).to.include('▸ Live Chunk & Task Activity');
+    expect(html).to.include('Live Chunk & Task Activity');
+    expect(html).to.include('data-section="live-chunk-activity"');
   });
 
   it('6. Tree Providers: Workers, Discovered, Tasks render correctly', async () => {

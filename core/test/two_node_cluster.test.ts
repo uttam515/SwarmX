@@ -335,4 +335,33 @@ describe('Two-Node macOS Cluster Integration & Fault Tolerance Tests (Step 4A)',
     // Cleanup worker 1
     worker1.ws.close();
   });
+
+  it('Immediate Worker Unregistration on Disconnect and Heartbeat Sweep', async () => {
+    // 1. Initially no connected workers
+    expect(workerManager.listWorkers().length).to.equal(0);
+
+    // 2. Connect and pair worker
+    const worker = await connectAndPairWorker('mac-worker-live-test', "Live MacBook Air");
+    expect(workerManager.listWorkers().length).to.equal(1);
+    expect(workerManager.getWorker('mac-worker-live-test')).to.not.be.undefined;
+
+    // 3. Close WebSocket and verify immediate unregistration
+    worker.ws.close();
+    await new Promise((r) => setTimeout(r, 100));
+
+    expect(workerManager.listWorkers().length).to.equal(0);
+    expect(workerManager.getWorker('mac-worker-live-test')).to.be.undefined;
+
+    // 4. Test sweepDeadWorkers for dead/stale heartbeat
+    const worker2 = await connectAndPairWorker('mac-worker-stale-test', "Stale MacBook Air");
+    expect(workerManager.listWorkers().length).to.equal(1);
+
+    // Simulate stale heartbeat (> 10s old)
+    const wState = workerManager.getWorker('mac-worker-stale-test')!;
+    wState.lastHeartbeatMs = Date.now() - 15000;
+
+    transportServer.sweepDeadWorkers();
+    expect(workerManager.listWorkers().length).to.equal(0);
+    worker2.ws.close();
+  });
 });

@@ -8,6 +8,7 @@ import { ProcessManager } from '../process_manager';
 export class DashboardViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'swarmx.dashboardView';
   private _view?: vscode.WebviewView;
+  private openSections: Set<string> = new Set<string>();
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -15,6 +16,18 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
     private readonly envManager: EnvironmentManager,
     private readonly processManager?: ProcessManager
   ) {}
+
+  public isSectionOpen(sectionId: string): boolean {
+    return this.openSections.has(sectionId);
+  }
+
+  public setSectionOpen(sectionId: string, open: boolean): void {
+    if (open) {
+      this.openSections.add(sectionId);
+    } else {
+      this.openSections.delete(sectionId);
+    }
+  }
 
   public resolveWebviewView(
     webviewView: vscode.WebviewView,
@@ -30,6 +43,15 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
 
     webviewView.webview.onDidReceiveMessage(async (data) => {
       switch (data.command) {
+        case 'toggleSection':
+          if (data.section) {
+            if (data.open) {
+              this.openSections.add(data.section);
+            } else {
+              this.openSections.delete(data.section);
+            }
+          }
+          break;
         case 'refresh':
           await this.update();
           break;
@@ -523,6 +545,18 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
             display: flex;
             justify-content: space-between;
             align-items: center;
+            list-style: none;
+          }
+          details.diag-details summary::-webkit-details-marker {
+            display: none;
+          }
+          details.diag-details summary .arrow {
+            display: inline-block;
+            transition: transform 0.15s ease;
+            margin-right: 4px;
+          }
+          details.diag-details[open] summary .arrow {
+            transform: rotate(90deg);
           }
           details.diag-details summary:hover {
             color: #fff;
@@ -759,15 +793,15 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
         </div>
 
         <!-- COLLAPSIBLE DIAGNOSTICS & ADVANCED TELEMETRY -->
-        <details class="diag-details">
-          <summary><span>▸ Live Chunk & Task Activity</span></summary>
+        <details class="diag-details" data-section="live-chunk-activity"${this.openSections.has('live-chunk-activity') ? ' open' : ''}>
+          <summary><span><span class="arrow">▸</span> Live Chunk & Task Activity</span></summary>
           <div class="diag-content">
             ${chunkActivityHtml || '<div class="empty-state">No chunk activity recorded yet.</div>'}
           </div>
         </details>
 
-        <details class="diag-details">
-          <summary><span>▸ Queue & Scheduling Breakdown</span></summary>
+        <details class="diag-details" data-section="queue-scheduling"${this.openSections.has('queue-scheduling') ? ' open' : ''}>
+          <summary><span><span class="arrow">▸</span> Queue & Scheduling Breakdown</span></summary>
           <div class="diag-content">
             <div class="row">
               <span class="row-label">Queue / Scheduling:</span>
@@ -788,22 +822,22 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
           </div>
         </details>
 
-        <details class="diag-details">
-          <summary><span>▸ Worker Details & Telemetry</span></summary>
+        <details class="diag-details" data-section="worker-telemetry"${this.openSections.has('worker-telemetry') ? ' open' : ''}>
+          <summary><span><span class="arrow">▸</span> Worker Details & Telemetry</span></summary>
           <div class="diag-content">
             ${workersListHtml}
           </div>
         </details>
 
-        <details class="diag-details">
-          <summary><span>▸ Discovered Devices (Pairing & Trust)</span></summary>
+        <details class="diag-details" data-section="discovered-devices"${this.openSections.has('discovered-devices') ? ' open' : ''}>
+          <summary><span><span class="arrow">▸</span> Discovered Devices (Pairing & Trust)</span></summary>
           <div class="diag-content">
             ${discoveredHtml}
           </div>
         </details>
 
-        <details class="diag-details">
-          <summary><span>▸ Validation & Integrity</span></summary>
+        <details class="diag-details" data-section="validation-integrity"${this.openSections.has('validation-integrity') ? ' open' : ''}>
+          <summary><span><span class="arrow">▸</span> Validation & Integrity</span></summary>
           <div class="diag-content">
             <ul class="proof-list">
               <li class="proof-item"><span class="proof-check">✓</span> Bit-Accurate float output verification</li>
@@ -813,8 +847,8 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
           </div>
         </details>
 
-        <details class="diag-details">
-          <summary><span>▸ Security & Cryptography</span></summary>
+        <details class="diag-details" data-section="security-cryptography"${this.openSections.has('security-cryptography') ? ' open' : ''}>
+          <summary><span><span class="arrow">▸</span> Security & Cryptography</span></summary>
           <div class="diag-content">
             <ul class="proof-list">
               <li class="proof-item"><span class="proof-check">✓</span> Curve25519 (X25519 ECDH) Key Agreement</li>
@@ -825,8 +859,8 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
           </div>
         </details>
 
-        <details class="diag-details">
-          <summary><span>▸ Observability & Diagnostic Logs</span></summary>
+        <details class="diag-details" data-section="diagnostics"${this.openSections.has('diagnostics') ? ' open' : ''}>
+          <summary><span><span class="arrow">▸</span> Observability & Diagnostic Logs</span></summary>
           <div class="diag-content">
             <div class="logs-container">
               ${logsHtml}
@@ -837,8 +871,8 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
           </div>
         </details>
 
-        <details class="diag-details">
-          <summary><span>▸ Architecture & Pipeline Flow</span></summary>
+        <details class="diag-details" data-section="architecture"${this.openSections.has('architecture') ? ' open' : ''}>
+          <summary><span><span class="arrow">▸</span> Architecture & Pipeline Flow</span></summary>
           <div class="diag-content" style="font-size: 10px; color: #aaa; text-align: center;">
             Python App (Zero Imports) → sitecustomize Hook → Core IPC (/tmp/swarmx.sock) → Scored Scheduler → N-Worker Distributed Swarm Nodes → Tolerance Validator → Contiguous Result
           </div>
@@ -849,6 +883,26 @@ export class DashboardViewProvider implements vscode.WebviewViewProvider {
           function sendAction(cmd, payload) {
             vscode.postMessage({ command: cmd, ...payload });
           }
+
+          // Restore and persist open state across DOM updates
+          const previousState = vscode.getState() || { openSections: [] };
+          const openSections = new Set(previousState.openSections || []);
+
+          document.querySelectorAll('details[data-section]').forEach(d => {
+            const sec = d.getAttribute('data-section');
+            if (openSections.has(sec)) {
+              d.open = true;
+            }
+            d.addEventListener('toggle', () => {
+              if (d.open) {
+                openSections.add(sec);
+              } else {
+                openSections.delete(sec);
+              }
+              vscode.setState({ openSections: Array.from(openSections) });
+              sendAction('toggleSection', { section: sec, open: d.open });
+            });
+          });
         </script>
       </body>
     </html>`;
