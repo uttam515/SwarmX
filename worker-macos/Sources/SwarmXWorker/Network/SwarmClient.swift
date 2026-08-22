@@ -8,8 +8,10 @@ public class SwarmClient {
     private var browser: NWBrowser?
     private let queue = DispatchQueue(label: "org.swarmx.worker.network", qos: .userInitiated)
     private var timer: Timer?
+    private var discoveryTimer: Timer?
     private var isConnected: Bool = false
     private var isBrowsing: Bool = false
+    private var isExplicitHostMode: Bool = false
 
     public var deviceId: String {
         get {
@@ -36,6 +38,7 @@ public class SwarmClient {
     public func startAutoDiscoveryAndConnect() {
         guard !self.isBrowsing, !self.isConnected else { return }
         self.isBrowsing = true
+        self.isExplicitHostMode = false
         print("🔍 Scanning for SwarmX Host Coordinator via Bonjour (_swarmx._tcp)...")
 
         let descriptor = NWBrowser.Descriptor.bonjour(type: "_swarmx._tcp", domain: "local.")
@@ -60,17 +63,16 @@ public class SwarmClient {
             guard let self = self, self.isBrowsing, !self.isConnected else { return }
             if let firstMatch = results.first {
                 print("🎯 Discovered SwarmX Host Coordinator: \(firstMatch.endpoint)")
-                self.stopDiscovery()
                 self.connect(to: firstMatch.endpoint)
             }
         }
 
         b.start(queue: self.queue)
 
-        // Fallback: If Bonjour discovery doesn't resolve within 3 seconds, attempt default local host
-        self.queue.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+        // Fallback: If Bonjour discovery doesn't resolve within 4 seconds, attempt default local host
+        self.queue.asyncAfter(deadline: .now() + 4.0) { [weak self] in
             guard let self = self, self.isBrowsing, !self.isConnected else { return }
-            print("ℹ️ Auto-discovery still scanning. Attempting direct fallback connection to \(self.hostUrl)...")
+            print("ℹ️ Auto-discovery scanning. Attempting direct fallback connection to \(self.hostUrl)...")
             self.connect(hostUrl: self.hostUrl)
         }
     }
@@ -85,7 +87,7 @@ public class SwarmClient {
      * Connect directly to an NWEndpoint (from Bonjour or explicit resolution)
      */
     public func connect(to endpoint: NWEndpoint) {
-        self.disconnect()
+        self.disconnect(reconnect: false)
         print("🔗 Connecting to SwarmX Host at \(endpoint)...")
         self.initiateConnection(to: endpoint)
     }
@@ -94,7 +96,8 @@ public class SwarmClient {
      * Connect to a specific host URL (e.g. from CLI --host)
      */
     public func connect(hostUrl: URL? = nil) {
-        self.disconnect()
+        self.disconnect(reconnect: false)
+        self.isExplicitHostMode = true
         if let hostUrl = hostUrl {
             self.hostUrl = hostUrl
         }
@@ -137,14 +140,21 @@ public class SwarmClient {
                 print("[LOCAL-WORKER] WEBSOCKET_CONNECTED")
                 self.sendDiscoveryBeacon()
                 self.listen()
+                if PairingManager.shared.activeSessionId == nil {
+                    self.startDiscoveryHeartbeat()
+                }
             case .waiting(let error):
                 print("⏳ WebSocket connecting (waiting for path): \(error.localizedDescription)")
             case .failed(let error):
                 self.isConnected = false
+                self.stopDiscoveryHeartbeat()
                 print("❌ WebSocket connection failed: \(error.localizedDescription)")
+                self.scheduleAutoReconnect()
             case .cancelled:
                 self.isConnected = false
+                self.stopDiscoveryHeartbeat()
                 print("🔌 WebSocket disconnected from Host.")
+                self.scheduleAutoReconnect()
             default:
                 break
             }
@@ -153,12 +163,48 @@ public class SwarmClient {
         conn.start(queue: self.queue)
     }
 
-    public func disconnect() {
+    private func scheduleAutoReconnect() {
+        self.queue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            guard let self = self, !self.isConnected else { return }
+            print("🔄 Auto-reconnecting to SwarmX Coordinator...")
+            if self.isExplicitHostMode {
+                self.connect(hostUrl: self.hostUrl)
+            } else {
+                self.startAutoDiscoveryAndConnect()
+            }
+        }
+    }
+
+    private func startDiscoveryHeartbeat() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.discoveryTimer?.invalidate()
+            self.discoveryTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
+                guard let self = self, self.isConnected else { return }
+                if PairingManager.shared.activeSessionId == nil {
+                    self.sendDiscoveryBeacon()
+                }
+            }
+        }
+    }
+
+    private func stopDiscoveryHeartbeat() {
+        DispatchQueue.main.async { [weak self] in
+            self?.discoveryTimer?.invalidate()
+            self?.discoveryTimer = nil
+        }
+    }
+
+    public func disconnect(reconnect: Bool = false) {
+        self.stopDiscoveryHeartbeat()
         self.timer?.invalidate()
         self.timer = nil
         self.isConnected = false
         self.connection?.cancel()
         self.connection = nil
+        if reconnect {
+            self.scheduleAutoReconnect()
+        }
     }
 
     private var isListening = false
@@ -345,6 +391,7 @@ public class SwarmClient {
 
         case "PAIRING_SUCCESS":
             if let sessionId = json["sessionId"] as? String {
+                self.stopDiscoveryHeartbeat()
                 PairingManager.shared.activateSession(sessionId: sessionId)
                 print("🔒 Secure session established (Session ID: \(sessionId)).")
                 print("[LOCAL-WORKER] REGISTERED")

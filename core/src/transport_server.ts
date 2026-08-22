@@ -81,7 +81,9 @@ export class TransportServer {
         const devId = (ws as any)._workerDeviceId || workerDeviceId;
         Logger.transport(`WebSocket closed for ${devId || remoteAddress}`);
         if (devId) {
-          this.workerSockets.delete(devId);
+          if (this.workerSockets.get(devId) === ws) {
+            this.workerSockets.delete(devId);
+          }
           this.workerManager.unregisterWorker(devId);
           Logger.workerState(`DISCONNECTED: ${devId}`);
           // Worker-loss recovery: Reclaim all in-flight tasks assigned to this disconnected worker
