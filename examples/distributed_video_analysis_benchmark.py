@@ -21,7 +21,10 @@ sdk_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "sdk", 
 if sdk_path not in sys.path:
     sys.path.insert(0, sdk_path)
 
-from swarmx.client import SwarmClient
+try:
+    from swarmx.client import SwarmClient  # type: ignore
+except ImportError:
+    SwarmClient = None  # type: ignore
 
 def check_core_status():
     socket_path = os.environ.get("SWARMX_IPC_PATH", "/tmp/swarmx.sock")

@@ -27,7 +27,7 @@ if sdk_path not in sys.path:
     sys.path.insert(0, sdk_path)
 
 try:
-    from swarmx.client import SwarmClient
+    from swarmx.client import SwarmClient  # type: ignore
 except ImportError:
     print("❌ Error: SwarmX Python SDK not found. Ensure sdk/python is present.")
     sys.exit(1)
