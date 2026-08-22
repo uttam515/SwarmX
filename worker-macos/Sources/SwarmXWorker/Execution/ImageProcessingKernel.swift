@@ -330,7 +330,7 @@ public class ImageProcessingKernel {
     }
 
     /**
-     * Executes native multi-frame video analysis (luminance, gradient edge energy, and motion energy).
+     * Executes native multi-pass video analysis (luminance, Sobel 3x3 gradient, Laplacian curvature, histogram entropy, and motion energy).
      * Operates over a contiguous array of raw frame bytes and returns a compact JSON summary string.
      */
     public static func analyzeVideoFrames(
@@ -351,7 +351,9 @@ public class ImageProcessingKernel {
 
         input.withUnsafeBytes { rawPtr in
             guard let basePtr = rawPtr.bindMemory(to: UInt8.self).baseAddress else { return }
-            var prevFramePtr: UnsafePointer<UInt8>? = nil
+            var prevLuminance = [Double](repeating: 0.0, count: width * height)
+            var hasPrevFrame = false
+            var currentLuminance = [Double](repeating: 0.0, count: width * height)
 
             for f in 0..<frameCount {
                 let currentFramePtr = basePtr.advanced(by: f * frameBytes)
@@ -359,65 +361,96 @@ public class ImageProcessingKernel {
 
                 var sumLum: Double = 0.0
                 var sumLumSq: Double = 0.0
-                var sumEdgeEnergy: Double = 0.0
-                var sumMotion: Double = 0.0
+                var histBins = [Int](repeating: 0, count: 16)
 
+                // Pass 1: Extract Luminance, Histogram & Moments
                 for y in 0..<height {
                     let rowOffset = y * width * channels
-                    let nextRowOffset = min(height - 1, y + 1) * width * channels
-
+                    let lumRowOffset = y * width
                     for x in 0..<width {
                         let pxOffset = rowOffset + x * channels
-                        let nextPxOffset = rowOffset + min(width - 1, x + 1) * channels
-                        let downPxOffset = nextRowOffset + x * channels
-
                         let r = Double(currentFramePtr[pxOffset])
                         let g = Double(currentFramePtr[pxOffset + min(1, channels - 1)])
                         let b = Double(currentFramePtr[pxOffset + min(2, channels - 1)])
                         let lum = 0.299 * r + 0.587 * g + 0.114 * b
-
+                        currentLuminance[lumRowOffset + x] = lum
                         sumLum += lum
                         sumLumSq += lum * lum
 
-                        let nextR = Double(currentFramePtr[nextPxOffset])
-                        let nextG = Double(currentFramePtr[nextPxOffset + min(1, channels - 1)])
-                        let nextB = Double(currentFramePtr[nextPxOffset + min(2, channels - 1)])
-                        let nextLum = 0.299 * nextR + 0.587 * nextG + 0.114 * nextB
+                        let binIdx = min(15, max(0, Int(lum / 16.0)))
+                        histBins[binIdx] += 1
+                    }
+                }
 
-                        let downR = Double(currentFramePtr[downPxOffset])
-                        let downG = Double(currentFramePtr[downPxOffset + min(1, channels - 1)])
-                        let downB = Double(currentFramePtr[downPxOffset + min(2, channels - 1)])
-                        let downLum = 0.299 * downR + 0.587 * downG + 0.114 * downB
+                // Pass 2: Sobel 3x3 Spatial Filter & Laplacian 2D Curvature
+                var sumSobelEnergy: Double = 0.0
+                var sumLaplacian: Double = 0.0
+                var sumMotion: Double = 0.0
 
-                        let dx = abs(nextLum - lum)
-                        let dy = abs(downLum - lum)
-                        sumEdgeEnergy += (dx + dy)
+                for y in 0..<height {
+                    let yPrev = max(0, y - 1) * width
+                    let yCurr = y * width
+                    let yNext = min(height - 1, y + 1) * width
 
-                        if let prevPtr = prevFramePtr {
-                            let prevR = Double(prevPtr[pxOffset])
-                            let prevG = Double(prevPtr[pxOffset + min(1, channels - 1)])
-                            let prevB = Double(prevPtr[pxOffset + min(2, channels - 1)])
-                            let prevLum = 0.299 * prevR + 0.587 * prevG + 0.114 * prevB
-                            sumMotion += abs(lum - prevLum)
+                    for x in 0..<width {
+                        let xPrev = max(0, x - 1)
+                        let xNext = min(width - 1, x + 1)
+
+                        // Sobel Gx
+                        let gx = (currentLuminance[yPrev + xNext] - currentLuminance[yPrev + xPrev])
+                               + 2.0 * (currentLuminance[yCurr + xNext] - currentLuminance[yCurr + xPrev])
+                               + (currentLuminance[yNext + xNext] - currentLuminance[yNext + xPrev])
+
+                        // Sobel Gy
+                        let gy = (currentLuminance[yNext + xPrev] - currentLuminance[yPrev + xPrev])
+                               + 2.0 * (currentLuminance[yNext + x] - currentLuminance[yPrev + x])
+                               + (currentLuminance[yNext + xNext] - currentLuminance[yPrev + xNext])
+
+                        let gradMag = sqrt(gx * gx + gy * gy)
+                        sumSobelEnergy += gradMag
+
+                        // Discrete Laplacian 2D
+                        let lap = currentLuminance[yCurr + xNext]
+                                + currentLuminance[yCurr + xPrev]
+                                + currentLuminance[yNext + x]
+                                + currentLuminance[yPrev + x]
+                                - 4.0 * currentLuminance[yCurr + x]
+                        sumLaplacian += abs(lap)
+
+                        if hasPrevFrame {
+                            sumMotion += abs(currentLuminance[yCurr + x] - prevLuminance[yCurr + x])
                         }
+                    }
+                }
+
+                // Pass 3: Shannon Entropy
+                var entropy: Double = 0.0
+                for binCount in histBins {
+                    if binCount > 0 {
+                        let p = Double(binCount) / Double(totalPixels)
+                        entropy -= p * log2(p)
                     }
                 }
 
                 let meanLum = sumLum / Double(totalPixels)
                 let varianceLum = max(0.0, (sumLumSq / Double(totalPixels)) - (meanLum * meanLum))
-                let edgeDensity = sumEdgeEnergy / Double(totalPixels)
-                let motionEnergy = prevFramePtr != nil ? (sumMotion / Double(totalPixels)) : 0.0
+                let edgeDensity = sumSobelEnergy / Double(totalPixels)
+                let laplacianEnergy = sumLaplacian / Double(totalPixels)
+                let motionEnergy = hasPrevFrame ? (sumMotion / Double(totalPixels)) : 0.0
                 let blurScore = sqrt(varianceLum) * (edgeDensity / 10.0)
 
                 results.append([
                     "frameIndex": startFrameIndex + f,
                     "luminance": round(meanLum * 100.0) / 100.0,
                     "edgeDensity": round(edgeDensity * 100.0) / 100.0,
+                    "laplacianEnergy": round(laplacianEnergy * 100.0) / 100.0,
+                    "entropy": round(entropy * 100.0) / 100.0,
                     "motionEnergy": round(motionEnergy * 100.0) / 100.0,
                     "blurScore": round(blurScore * 100.0) / 100.0
                 ])
 
-                prevFramePtr = currentFramePtr
+                prevLuminance = currentLuminance
+                hasPrevFrame = true
             }
         }
 

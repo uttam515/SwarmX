@@ -2,14 +2,13 @@
 """
 ================================================================================
                     SWARMX DISTRIBUTED VIDEO ANALYSIS
-                            Flagship Live Demo
+                          Flagship Live Benchmark
 ================================================================================
 
-A single self-contained, presentation-ready demonstration of SwarmX:
-1. Generates / loads a deterministic 900-frame video dataset (512x512 RGBA).
-2. Measures single-device local CPU baseline execution.
-3. Dispatches the workload to SwarmX Core for dynamic multi-chunk work-queue
-   scheduling across 3 physical Apple Silicon Macs.
+A self-contained, 100% non-interactive flagship demonstration of SwarmX:
+1. Generates / loads a deterministic 300-frame video stream (256×256 RGBA).
+2. Measures single-device local CPU baseline execution (multi-pass feature extraction).
+3. Dispatches the workload to SwarmX Core dynamic work queue across 3 physical Macs.
 4. Validates numerical accuracy per frame.
 5. Computes and displays true measured speedup and worker distribution.
 """
@@ -33,13 +32,13 @@ except ImportError:
     sys.exit(1)
 
 def print_header(title: str):
-    print("\n" + "=" * 68)
+    print("\n" + "=" * 70)
     print(f"        {title}")
-    print("=" * 68)
+    print("=" * 70)
 
 def print_section(title: str):
     print("\n" + title)
-    print("-" * 68)
+    print("-" * 70)
 
 def check_cluster_readiness(socket_path: str = "/tmp/swarmx.sock"):
     if not os.path.exists(socket_path):
@@ -59,11 +58,12 @@ def check_cluster_readiness(socket_path: str = "/tmp/swarmx.sock"):
     except Exception as e:
         return False, f"Could not query Core status: {e}", [], 0
 
-def generate_video_stream(total_frames: int = 900, width: int = 512, height: int = 512) -> bytes:
+def generate_video_stream(total_frames: int = 300, width: int = 256, height: int = 256) -> bytes:
     """Generates a deterministic synthetic video stream with motion and spatial gradient features."""
+    total_bytes = total_frames * width * height * 4
     print(f"  • Frame count    : {total_frames} frames")
     print(f"  • Resolution     : {width} × {height} (RGBA uint8)")
-    print(f"  • Raw video size : {(total_frames * width * height * 4) / (1024 * 1024):.2f} MB")
+    print(f"  • Raw video size : {total_bytes / (1024 * 1024):.2f} MB ({total_bytes:,} bytes)")
     
     t0 = time.perf_counter()
     frames = np.zeros((total_frames, height, width, 4), dtype=np.uint8)
@@ -89,32 +89,61 @@ def generate_video_stream(total_frames: int = 900, width: int = 512, height: int
     return raw_bytes
 
 def compute_local_baseline(raw_bytes: bytes, total_frames: int, width: int, height: int, channels: int = 4):
-    """Computes the exact same multi-frame analysis in-process on the local host CPU."""
+    """
+    Computes the exact mathematical multi-pass video frame analysis in-process on local host CPU:
+    1. Luminance & Variance Moments
+    2. Sobel 3x3 Spatial Gradient Magnitude Filter
+    3. Discrete Laplacian 2D Second-Derivative Curvature
+    4. 16-Bin Intensity Histogram & Shannon Entropy
+    5. Temporal Motion Energy Differential
+    """
     frame_bytes = width * height * channels
     results = []
-    prev_frame = None
+    prev_lum = None
 
     for f in range(total_frames):
         offset = f * frame_bytes
         frame_buf = raw_bytes[offset:offset + frame_bytes]
         frame_arr = np.frombuffer(frame_buf, dtype=np.uint8).reshape((height, width, channels))
         
-        # Luminance
-        lum = 0.299 * frame_arr[:, :, 0] + 0.587 * frame_arr[:, :, 1] + 0.114 * frame_arr[:, :, 2]
+        # Pass 1: Extract Luminance
+        lum = 0.299 * frame_arr[:, :, 0].astype(np.float64) + \
+              0.587 * frame_arr[:, :, 1].astype(np.float64) + \
+              0.114 * frame_arr[:, :, 2].astype(np.float64)
+        
         mean_lum = float(np.mean(lum))
         var_lum = float(np.var(lum))
         
-        # Spatial edge energy (gradient delta)
-        dx = np.abs(np.diff(lum, axis=1, append=lum[:, -1:]))
-        dy = np.abs(np.diff(lum, axis=0, append=lum[-1:, :]))
-        edge_density = float(np.mean(dx + dy))
+        # Pass 2: Sobel 3x3 Spatial Filter
+        # Gx: [-1, 0, 1; -2, 0, 2; -1, 0, 1]
+        # Gy: [-1, -2, -1; 0, 0, 0; 1, 2, 1]
+        padded = np.pad(lum, ((1, 1), (1, 1)), mode='edge')
+        gx = (padded[:-2, 2:] - padded[:-2, :-2]) + \
+             2.0 * (padded[1:-1, 2:] - padded[1:-1, :-2]) + \
+             (padded[2:, 2:] - padded[2:, :-2])
         
-        # Temporal motion energy relative to previous frame
-        if prev_frame is not None:
-            motion = float(np.mean(np.abs(lum - prev_frame)))
+        gy = (padded[2:, :-2] - padded[:-2, :-2]) + \
+             2.0 * (padded[2:, 1:-1] - padded[:-2, 1:-1]) + \
+             (padded[2:, 2:] - padded[:-2, 2:])
+        
+        grad_mag = np.sqrt(gx * gx + gy * gy)
+        edge_density = float(np.mean(grad_mag))
+        
+        # Pass 3: Discrete Laplacian 2D Curvature
+        lap = padded[1:-1, 2:] + padded[1:-1, :-2] + padded[2:, 1:-1] + padded[:-2, 1:-1] - 4.0 * lum
+        laplacian_energy = float(np.mean(np.abs(lap)))
+        
+        # Pass 4: 16-Bin Histogram & Shannon Entropy
+        hist, _ = np.histogram(lum, bins=16, range=(0, 256))
+        p = hist[hist > 0] / float(width * height)
+        entropy = float(-np.sum(p * np.log2(p)))
+        
+        # Pass 5: Temporal Motion Energy
+        if prev_lum is not None:
+            motion = float(np.mean(np.abs(lum - prev_lum)))
         else:
             motion = 0.0
-        prev_frame = lum
+        prev_lum = lum
         
         blur_score = math.sqrt(max(0.0, var_lum)) * (edge_density / 10.0)
         
@@ -122,6 +151,8 @@ def compute_local_baseline(raw_bytes: bytes, total_frames: int, width: int, heig
             "frameIndex": f,
             "luminance": round(mean_lum, 2),
             "edgeDensity": round(edge_density, 2),
+            "laplacianEnergy": round(laplacian_energy, 2),
+            "entropy": round(entropy, 2),
             "motionEnergy": round(motion, 2),
             "blurScore": round(blur_score, 2)
         })
@@ -130,17 +161,17 @@ def compute_local_baseline(raw_bytes: bytes, total_frames: int, width: int, heig
 
 def main():
     print_header("SWARMX DISTRIBUTED VIDEO FRAME ANALYSIS")
-    print("  • Flagship Pipeline : Distributed Video Frame Scene & Motion Analysis (v1)")
-    print("  • Workload Config   : 900 Frames (512 × 512 RGBA uint8, ~900 MB planar payload)")
-    print("  • Dynamic Partitioning: 30 Frames / Chunk (30 Independent Task Chunks)")
+    print("  • Flagship Pipeline : Distributed Multi-Pass Video Frame Analysis (v1)")
+    print("  • Workload Config   : 300 Frames (256 × 256 RGBA uint8, ~78.6 MB planar payload)")
+    print("  • Dynamic Partitioning: 10 Frames / Chunk (30 Independent Task Chunks)")
     print("  • Execution Target  : Dynamic Work-Queue Dispatch Across Available Swarm Nodes")
-    print("  • Execution Mode    : 100% Non-Interactive Automatic Demo (No Terminal Prompts)")
+    print("  • Execution Mode    : 100% Non-Interactive Automatic Demo (Zero Terminal Input)")
 
     # 1. Workload Configuration
-    total_frames = 900
-    chunk_size = 30
-    width = 512
-    height = 512
+    total_frames = 300
+    chunk_size = 10
+    width = 256
+    height = 256
     channels = 4
     total_chunks = math.ceil(total_frames / chunk_size)
 
@@ -167,7 +198,7 @@ def main():
     # PHASE 1: LOCAL SINGLE-DEVICE EXECUTION
     # -------------------------------------------------------------------------
     print_section("2. LOCAL SINGLE-DEVICE EXECUTION (1 Mac Baseline)")
-    print(f"  • Processing all {total_frames} frames locally on host CPU...")
+    print(f"  • Processing all {total_frames} frames locally on host CPU (5 analytical passes/frame)...")
     t0 = time.perf_counter()
     local_results = compute_local_baseline(video_bytes, total_frames, width, height, channels)
     t_local = time.perf_counter() - t0
@@ -180,7 +211,7 @@ def main():
     # PHASE 2: SWARMX DISTRIBUTED DYNAMIC QUEUE EXECUTION
     # -------------------------------------------------------------------------
     print_section(f"3. SWARMX DISTRIBUTED EXECUTION ({eligible_count} Physical Workers, {total_chunks} Chunks)")
-    print(f"  • Slicing {total_frames} frames into {total_chunks} independent tasks (30 frames/chunk)...")
+    print(f"  • Slicing {total_frames} frames into {total_chunks} independent tasks (10 frames/chunk)...")
     print("  • Dispatching to SwarmX Dynamic Work Queue...")
 
     client = SwarmClient(socket_path=os.environ.get("SWARMX_IPC_PATH", "/tmp/swarmx.sock"))
@@ -241,18 +272,24 @@ def main():
     if frame_count_match:
         lum_diffs = [abs(local_results[i]["luminance"] - swarm_results[i].get("luminance", 0)) for i in range(total_frames)]
         edge_diffs = [abs(local_results[i]["edgeDensity"] - swarm_results[i].get("edgeDensity", 0)) for i in range(total_frames)]
+        lap_diffs = [abs(local_results[i]["laplacianEnergy"] - swarm_results[i].get("laplacianEnergy", 0)) for i in range(total_frames)]
+        ent_diffs = [abs(local_results[i]["entropy"] - swarm_results[i].get("entropy", 0)) for i in range(total_frames)]
         motion_diffs = [abs(local_results[i]["motionEnergy"] - swarm_results[i].get("motionEnergy", 0)) for i in range(total_frames)]
 
         max_lum_diff = max(lum_diffs)
         max_edge_diff = max(edge_diffs)
+        max_lap_diff = max(lap_diffs)
+        max_ent_diff = max(ent_diffs)
         max_motion_diff = max(motion_diffs)
-        is_valid = max_lum_diff <= 1.0 and max_edge_diff <= 1.0 and max_motion_diff <= 1.0
+        is_valid = max_lum_diff <= 1.0 and max_edge_diff <= 1.0 and max_lap_diff <= 1.0 and max_ent_diff <= 1.0 and max_motion_diff <= 1.0
 
         print(f"  • Frame Count Match    : {frame_count_match} ({len(swarm_results)} / {total_frames})")
         print(f"  • Max Luminance Delta  : {max_lum_diff:.4f} (Tolerance: <= 1.0)")
         print(f"  • Max Edge Energy Delta: {max_edge_diff:.4f} (Tolerance: <= 1.0)")
+        print(f"  • Max Laplacian Delta  : {max_lap_diff:.4f} (Tolerance: <= 1.0)")
+        print(f"  • Max Entropy Delta    : {max_ent_diff:.4f} (Tolerance: <= 1.0)")
         print(f"  • Max Motion Delta     : {max_motion_diff:.4f} (Tolerance: <= 1.0)")
-        print(f"  • Validation Status    : {'PASS ✓' if is_valid else 'FAIL ✗'}")
+        print(f"  • Validation Status    : {'PASS ✓ (Mathematically Equivalent)' if is_valid else 'FAIL ✗'}")
     else:
         is_valid = False
         print(f"  • Frame Count Match    : FAIL ✗ ({len(swarm_results)} / {total_frames})")
@@ -277,20 +314,22 @@ def main():
     # -------------------------------------------------------------------------
     # PHASE 5: FINAL DEMO VERDICT
     # -------------------------------------------------------------------------
-    speedup = t_local / t_swarm
+    speedup = t_local / t_swarm if t_swarm > 0 else 1.0
     time_saved_s = t_local - t_swarm
-    pct_improvement = ((t_local - t_swarm) / t_local) * 100.0
+    pct_improvement = ((t_local - t_swarm) / t_local) * 100.0 if t_local > 0 else 0.0
 
     print_header("FINAL PERFORMANCE VERDICT")
-    print(f"  Frames Analyzed  : {total_frames}")
-    print(f"  Chunks Completed : {total_chunks}")
-    print(f"  Workers Used     : {eligible_count} Physical Apple Silicon Nodes")
-    print(f"  Local Time (1 Mac): {t_local:.3f} s ({local_fps:.1f} fps)")
-    print(f"  SwarmX Time      : {t_swarm:.3f} s ({swarm_fps:.1f} fps)")
-    print(f"  Measured Speedup : {speedup:.2f}x")
-    print(f"  Net Time Saved   : {time_saved_s:.3f} s ({pct_improvement:+.1f}%)")
-    print(f"  Validation       : {'PASS ✓ (Tolerance-Aware Equivalence)' if is_valid else 'FAIL ✗'}")
-    print("=" * 68 + "\n")
+    print(f"  Frames Analyzed     : {total_frames}")
+    print(f"  Resolution          : {width} × {height} (RGBA)")
+    print(f"  Total Input Bytes   : {len(video_bytes):,} bytes ({len(video_bytes) / (1024 * 1024):.2f} MB)")
+    print(f"  Chunks Completed    : {len(chunk_dist)} / {total_chunks}")
+    print(f"  Workers Used        : {eligible_count} Physical Apple Silicon Nodes")
+    print(f"  Local Elapsed (1 Mac): {t_local:.3f} s ({local_fps:.1f} fps)")
+    print(f"  SwarmX Elapsed      : {t_swarm:.3f} s ({swarm_fps:.1f} fps)")
+    print(f"  Actual Speedup      : {speedup:.2f}x")
+    print(f"  Actual Improvement  : {pct_improvement:+.1f}% ({time_saved_s:.3f} s saved)")
+    print(f"  Validation Result   : {'PASS ✓ (Tolerance-Aware Equivalence)' if is_valid else 'FAIL ✗'}")
+    print("=" * 70 + "\n")
 
 if __name__ == "__main__":
     main()
