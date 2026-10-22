@@ -102,10 +102,3 @@ _Runs 4 XCTest tests asserting capability schema versioning, native sensor readi
 cd core
 npm start
 ```
-
-### 4. Start macOS Worker
-
-```bash
-cd worker-macos
-swift run swarmx-worker --connect
-```
