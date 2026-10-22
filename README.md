@@ -1,4 +1,4 @@
-# SwarmX — Phase 0 (Foundations)
+# SwarmX — Phase 0 
 
 SwarmX is a local-network, opt-in, developer-facing distributed execution runtime. A host (the developer's primary machine) recruits nearby worker devices under explicit per-device consent, decomposes workloads into tasks, schedules them adaptively based on live worker telemetry, and aggregates validated results.
 
