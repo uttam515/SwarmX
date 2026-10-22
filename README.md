@@ -95,10 +95,3 @@ swift test
 ```
 
 _Runs 4 XCTest tests asserting capability schema versioning, native sensor reading, transcript-bound SAS derivation parity, and AES-GCM AAD encryption/decryption._
-
-### 3. Start SwarmX Core Daemon
-
-```bash
-cd core
-npm start
-```
